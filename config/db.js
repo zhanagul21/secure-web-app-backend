@@ -14,7 +14,6 @@ const connectDB = async () => {
     });
 
     await pool.connect();
-
     console.log("PostgreSQL connected");
     return pool;
   } catch (error) {
@@ -24,6 +23,5 @@ const connectDB = async () => {
 };
 
 module.exports = {
-  pool,
   connectDB,
 };
