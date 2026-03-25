@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { verifyToken } = require("../middleware/authMiddleware");
-const { sql } = require("../config/db");
+const { connectDB } = require("../config/db");
 const speakeasy = require("speakeasy");
 const QRCode = require("qrcode");
 
@@ -9,19 +9,23 @@ const QRCode = require("qrcode");
 router.get("/profile", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
+    const db = await connectDB();
 
-    const result = await sql.query`
+    const result = await db.query(
+      `
       SELECT id, full_name, email, role, created_at, twofa_enabled
       FROM users
-      WHERE id = ${userId}
-    `;
+      WHERE id = $1
+      `,
+      [userId]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Пайдаланушы табылмады" });
     }
 
     res.json({
-      user: result.recordset[0],
+      user: result.rows[0],
     });
   } catch (error) {
     console.error("PROFILE ERROR:", error);
@@ -36,14 +40,16 @@ router.get("/all-users", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Тек admin ғана кіре алады" });
     }
 
-    const result = await sql.query`
+    const db = await connectDB();
+
+    const result = await db.query(`
       SELECT id, full_name, email, role, created_at, twofa_enabled
       FROM users
       ORDER BY id DESC
-    `;
+    `);
 
     res.json({
-      users: result.recordset,
+      users: result.rows,
     });
   } catch (error) {
     console.error("ALL USERS ERROR:", error);
@@ -59,12 +65,16 @@ router.put("/make-admin/:id", verifyToken, async (req, res) => {
     }
 
     const id = parseInt(req.params.id, 10);
+    const db = await connectDB();
 
-    await sql.query`
+    await db.query(
+      `
       UPDATE users
       SET role = 'admin'
-      WHERE id = ${id}
-    `;
+      WHERE id = $1
+      `,
+      [id]
+    );
 
     res.json({ message: "Қолданушы admin болды" });
   } catch (error) {
@@ -81,11 +91,15 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
     }
 
     const id = parseInt(req.params.id, 10);
+    const db = await connectDB();
 
-    await sql.query`
+    await db.query(
+      `
       DELETE FROM users
-      WHERE id = ${id}
-    `;
+      WHERE id = $1
+      `,
+      [id]
+    );
 
     res.json({ message: "Қолданушы өшірілді" });
   } catch (error) {
@@ -104,12 +118,16 @@ router.get("/2fa/setup", verifyToken, async (req, res) => {
     });
 
     const qr = await QRCode.toDataURL(secret.otpauth_url);
+    const db = await connectDB();
 
-    await sql.query`
+    await db.query(
+      `
       UPDATE users
-      SET twofa_secret = ${secret.base32}
-      WHERE id = ${req.user.id}
-    `;
+      SET twofa_secret = $1
+      WHERE id = $2
+      `,
+      [secret.base32, req.user.id]
+    );
 
     res.json({
       qr: qr,
@@ -133,17 +151,22 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Код міндетті" });
     }
 
-    const result = await sql.query`
+    const db = await connectDB();
+
+    const result = await db.query(
+      `
       SELECT twofa_secret
       FROM users
-      WHERE id = ${req.user.id}
-    `;
+      WHERE id = $1
+      `,
+      [req.user.id]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Пайдаланушы табылмады" });
     }
 
-    const secret = result.recordset[0].twofa_secret;
+    const secret = result.rows[0].twofa_secret;
 
     if (!secret) {
       return res.status(400).json({ message: "Алдымен QR жасап алыңыз" });
@@ -160,16 +183,22 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Код қате" });
     }
 
-    await sql.query`
+    await db.query(
+      `
       UPDATE users
-      SET twofa_enabled = 1
-      WHERE id = ${req.user.id}
-    `;
+      SET twofa_enabled = $1
+      WHERE id = $2
+      `,
+      [true, req.user.id]
+    );
 
-    await sql.query`
+    await db.query(
+      `
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${req.user.id}, '2FA_ENABLE', ${'Екі факторлы аутентификация қосылды'})
-    `;
+      VALUES ($1, $2, $3)
+      `,
+      [req.user.id, "2FA_ENABLE", "Екі факторлы аутентификация қосылды"]
+    );
 
     res.json({ message: "2FA сәтті қосылды" });
   } catch (error) {
