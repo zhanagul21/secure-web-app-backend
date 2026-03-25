@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { verifyToken } = require("../middleware/authMiddleware");
-const { pool } = require("../config/db");
+const { sql } = require("../config/db");
 const speakeasy = require("speakeasy");
 const QRCode = require("qrcode");
 
@@ -10,7 +10,7 @@ router.get("/profile", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT id, full_name, email, role, created_at, twofa_enabled
       FROM users
       WHERE id = ${userId}
@@ -36,7 +36,7 @@ router.get("/all-users", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Тек admin ғана кіре алады" });
     }
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT id, full_name, email, role, created_at, twofa_enabled
       FROM users
       ORDER BY id DESC
@@ -60,7 +60,7 @@ router.put("/make-admin/:id", verifyToken, async (req, res) => {
 
     const id = parseInt(req.params.id, 10);
 
-    await pool.query`
+    await sql.query`
       UPDATE users
       SET role = 'admin'
       WHERE id = ${id}
@@ -82,7 +82,7 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
 
     const id = parseInt(req.params.id, 10);
 
-    await pool.query`
+    await sql.query`
       DELETE FROM users
       WHERE id = ${id}
     `;
@@ -105,7 +105,7 @@ router.get("/2fa/setup", verifyToken, async (req, res) => {
 
     const qr = await QRCode.toDataURL(secret.otpauth_url);
 
-    await pool.query`
+    await sql.query`
       UPDATE users
       SET twofa_secret = ${secret.base32}
       WHERE id = ${req.user.id}
@@ -133,7 +133,7 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Код міндетті" });
     }
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT twofa_secret
       FROM users
       WHERE id = ${req.user.id}
@@ -160,13 +160,13 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Код қате" });
     }
 
-    await pool.query`
+    await sql.query`
       UPDATE users
       SET twofa_enabled = 1
       WHERE id = ${req.user.id}
     `;
 
-    await pool.query`
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${req.user.id}, '2FA_ENABLE', ${'Екі факторлы аутентификация қосылды'})
     `;

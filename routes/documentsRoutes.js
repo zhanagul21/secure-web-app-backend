@@ -6,7 +6,7 @@ const path = require("path");
 const fs = require("fs");
 
 const { verifyToken } = require("../middleware/authMiddleware");
-const { pool } = require("../config/db");
+const { sql } = require("../config/db");
 const { encryptFile, decryptFile } = require("../utils/encryption");
 const { convertToPdf } = require("../utils/officeConverter");
 
@@ -112,7 +112,7 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
       fs.unlinkSync(originalPath);
     }
 
-    await pool.query`
+    await sql.query`
       INSERT INTO documents (
         user_id,
         title,
@@ -133,7 +133,7 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
       )
     `;
 
-    await pool.query`
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${userId}, 'DOCUMENT_ADD', ${`Құжат қосылды: ${title}`})
     `;
@@ -154,7 +154,7 @@ router.get("/my", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT id, title, category, description, secret_content, original_name, mime_type, created_at
       FROM documents
       WHERE user_id = ${userId}
@@ -178,7 +178,7 @@ router.get("/", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT id, title, category, description, secret_content, original_name, mime_type, created_at
       FROM documents
       WHERE user_id = ${userId}
@@ -206,7 +206,7 @@ router.get("/view/:id", verifyToken, async (req, res) => {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT *
       FROM documents
       WHERE id = ${documentId} AND user_id = ${userId}
@@ -244,7 +244,7 @@ router.get("/view/:id", verifyToken, async (req, res) => {
     const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
     const txtTypes = [".txt"];
 
-    await pool.query`
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${userId}, 'DOCUMENT_VIEW', ${`Құжат қаралды: ${doc.title}`})
     `;
@@ -340,7 +340,7 @@ router.get("/download/:id", verifyToken, async (req, res) => {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
 
-    const result = await pool.query`
+    const result = await sql.query`
       SELECT *
       FROM documents
       WHERE id = ${documentId} AND user_id = ${userId}
@@ -365,7 +365,7 @@ router.get("/download/:id", verifyToken, async (req, res) => {
     const encryptedBuffer = fs.readFileSync(encryptedPath);
     const decryptedBuffer = decryptFile(encryptedBuffer);
 
-    await pool.query`
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${userId}, 'DOCUMENT_DOWNLOAD', ${`Құжат жүктелді: ${doc.title}`})
     `;
@@ -392,7 +392,7 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
 
-    const existing = await pool.query`
+    const existing = await sql.query`
       SELECT * FROM documents
       WHERE id = ${documentId} AND user_id = ${userId}
     `;
@@ -410,12 +410,12 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
       }
     }
 
-    await pool.query`
+    await sql.query`
       DELETE FROM documents
       WHERE id = ${documentId} AND user_id = ${userId}
     `;
 
-    await pool.query`
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${userId}, 'DOCUMENT_DELETE', ${`Құжат өшірілді: ${doc.title}`})
     `;
