@@ -6,7 +6,7 @@ const path = require("path");
 const fs = require("fs");
 
 const { verifyToken } = require("../middleware/authMiddleware");
-const { sql } = require("../config/db");
+const { connectDB } = require("../config/db");
 const { encryptFile, decryptFile } = require("../utils/encryption");
 const { convertToPdf } = require("../utils/officeConverter");
 
@@ -89,6 +89,7 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
   try {
     const userId = req.user.id;
     const { title, category, description } = req.body;
+    const db = await connectDB();
 
     if (!title || !category) {
       return res.status(400).json({
@@ -112,7 +113,8 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
       fs.unlinkSync(originalPath);
     }
 
-    await sql.query`
+    await db.query(
+      `
       INSERT INTO documents (
         user_id,
         title,
@@ -122,21 +124,26 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
         original_name,
         mime_type
       )
-      VALUES (
-        ${userId},
-        ${title},
-        ${category},
-        ${description || ""},
-        ${encryptedName},
-        ${req.file.originalname},
-        ${req.file.mimetype}
-      )
-    `;
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `,
+      [
+        userId,
+        title,
+        category,
+        description || "",
+        encryptedName,
+        req.file.originalname,
+        req.file.mimetype,
+      ]
+    );
 
-    await sql.query`
+    await db.query(
+      `
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${userId}, 'DOCUMENT_ADD', ${`Құжат қосылды: ${title}`})
-    `;
+      VALUES ($1, $2, $3)
+      `,
+      [userId, "DOCUMENT_ADD", `Құжат қосылды: ${title}`]
+    );
 
     res.status(201).json({
       message: "Құжат сәтті жүктелді және шифрланды",
@@ -153,15 +160,19 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
 router.get("/my", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
+    const db = await connectDB();
 
-    const result = await sql.query`
+    const result = await db.query(
+      `
       SELECT id, title, category, description, secret_content, original_name, mime_type, created_at
       FROM documents
-      WHERE user_id = ${userId}
+      WHERE user_id = $1
       ORDER BY id DESC
-    `;
+      `,
+      [userId]
+    );
 
-    const documentsWithSize = result.recordset.map((doc) => ({
+    const documentsWithSize = result.rows.map((doc) => ({
       ...doc,
       file_size: getFileSize(doc.secret_content),
     }));
@@ -177,15 +188,19 @@ router.get("/my", verifyToken, async (req, res) => {
 router.get("/", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
+    const db = await connectDB();
 
-    const result = await sql.query`
+    const result = await db.query(
+      `
       SELECT id, title, category, description, secret_content, original_name, mime_type, created_at
       FROM documents
-      WHERE user_id = ${userId}
+      WHERE user_id = $1
       ORDER BY id DESC
-    `;
+      `,
+      [userId]
+    );
 
-    const documentsWithSize = result.recordset.map((doc) => ({
+    const documentsWithSize = result.rows.map((doc) => ({
       ...doc,
       file_size: getFileSize(doc.secret_content),
     }));
@@ -205,18 +220,22 @@ router.get("/view/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
+    const db = await connectDB();
 
-    const result = await sql.query`
+    const result = await db.query(
+      `
       SELECT *
       FROM documents
-      WHERE id = ${documentId} AND user_id = ${userId}
-    `;
+      WHERE id = $1 AND user_id = $2
+      `,
+      [documentId, userId]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
-    const doc = result.recordset[0];
+    const doc = result.rows[0];
 
     if (!doc.secret_content) {
       return res.status(400).json({ message: "Файл жоқ" });
@@ -244,10 +263,13 @@ router.get("/view/:id", verifyToken, async (req, res) => {
     const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
     const txtTypes = [".txt"];
 
-    await sql.query`
+    await db.query(
+      `
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${userId}, 'DOCUMENT_VIEW', ${`Құжат қаралды: ${doc.title}`})
-    `;
+      VALUES ($1, $2, $3)
+      `,
+      [userId, "DOCUMENT_VIEW", `Құжат қаралды: ${doc.title}`]
+    );
 
     if (ext === ".pdf") {
       res.setHeader("Content-Type", "application/pdf");
@@ -339,18 +361,22 @@ router.get("/download/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
+    const db = await connectDB();
 
-    const result = await sql.query`
+    const result = await db.query(
+      `
       SELECT *
       FROM documents
-      WHERE id = ${documentId} AND user_id = ${userId}
-    `;
+      WHERE id = $1 AND user_id = $2
+      `,
+      [documentId, userId]
+    );
 
-    if (result.recordset.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
-    const doc = result.recordset[0];
+    const doc = result.rows[0];
 
     if (!doc.secret_content) {
       return res.status(400).json({ message: "Файл жоқ" });
@@ -365,10 +391,13 @@ router.get("/download/:id", verifyToken, async (req, res) => {
     const encryptedBuffer = fs.readFileSync(encryptedPath);
     const decryptedBuffer = decryptFile(encryptedBuffer);
 
-    await sql.query`
+    await db.query(
+      `
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${userId}, 'DOCUMENT_DOWNLOAD', ${`Құжат жүктелді: ${doc.title}`})
-    `;
+      VALUES ($1, $2, $3)
+      `,
+      [userId, "DOCUMENT_DOWNLOAD", `Құжат жүктелді: ${doc.title}`]
+    );
 
     const fileName = doc.original_name || "document";
     const mimeType = doc.mime_type || "application/octet-stream";
@@ -391,17 +420,22 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
+    const db = await connectDB();
 
-    const existing = await sql.query`
-      SELECT * FROM documents
-      WHERE id = ${documentId} AND user_id = ${userId}
-    `;
+    const existing = await db.query(
+      `
+      SELECT *
+      FROM documents
+      WHERE id = $1 AND user_id = $2
+      `,
+      [documentId, userId]
+    );
 
-    if (existing.recordset.length === 0) {
+    if (existing.rows.length === 0) {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
-    const doc = existing.recordset[0];
+    const doc = existing.rows[0];
 
     if (doc.secret_content) {
       const encryptedPath = path.join(uploadsDir, doc.secret_content);
@@ -410,15 +444,21 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
       }
     }
 
-    await sql.query`
+    await db.query(
+      `
       DELETE FROM documents
-      WHERE id = ${documentId} AND user_id = ${userId}
-    `;
+      WHERE id = $1 AND user_id = $2
+      `,
+      [documentId, userId]
+    );
 
-    await sql.query`
+    await db.query(
+      `
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${userId}, 'DOCUMENT_DELETE', ${`Құжат өшірілді: ${doc.title}`})
-    `;
+      VALUES ($1, $2, $3)
+      `,
+      [userId, "DOCUMENT_DELETE", `Құжат өшірілді: ${doc.title}`]
+    );
 
     res.json({ message: "Құжат өшірілді" });
   } catch (error) {
