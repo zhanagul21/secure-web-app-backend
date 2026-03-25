@@ -1,7 +1,7 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
-const { sql, connectDB } = require("../config/db");
+const { pool, connectDB } = require("../config/db");
 const { sendVerificationEmail } = require("../utils/sendEmail");
 
 // 1. Код жіберу
@@ -15,7 +15,7 @@ const sendCode = async (req, res) => {
       return res.status(400).json({ message: "Email міндетті" });
     }
 
-    const existing = await sql.query`
+    const existing = await pool.query`
       SELECT * FROM users WHERE email = ${email}
     `;
 
@@ -30,14 +30,14 @@ const sendCode = async (req, res) => {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     if (existing.recordset.length > 0) {
-      await sql.query`
+      await pool.query`
         UPDATE users
         SET verification_code = ${code},
             code_expires_at = ${expiresAt}
         WHERE email = ${email}
       `;
     } else {
-      await sql.query`
+      await pool.query`
         INSERT INTO users (
           full_name,
           email,
@@ -79,7 +79,7 @@ const verifyCode = async (req, res) => {
       return res.status(400).json({ message: "Email және код міндетті" });
     }
 
-    const result = await sql.query`
+    const result = await pool.query`
       SELECT * FROM users WHERE email = ${email}
     `;
 
@@ -115,7 +115,7 @@ const completeRegister = async (req, res) => {
       return res.status(400).json({ message: "Барлық өрістер міндетті" });
     }
 
-    const result = await sql.query`
+    const result = await pool.query`
       SELECT * FROM users WHERE email = ${email}
     `;
 
@@ -131,7 +131,7 @@ const completeRegister = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    await sql.query`
+    await pool.query`
       UPDATE users
       SET full_name = ${full_name},
           password_hash = ${hashedPassword},
@@ -161,7 +161,7 @@ const login = async (req, res) => {
       return res.status(400).json({ message: "Email және пароль міндетті" });
     }
 
-    const result = await sql.query`
+    const result = await pool.query`
       SELECT * FROM users WHERE email = ${email}
     `;
 
@@ -219,7 +219,7 @@ const login = async (req, res) => {
       { expiresIn: "1h" }
     );
 
-    await sql.query`
+    await pool.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${user.id}, 'LOGIN', ${`Кіру орындалды: ${user.email}`})
     `;
@@ -251,7 +251,7 @@ const verifyLogin2FA = async (req, res) => {
       return res.status(400).json({ message: "Email және 2FA коды міндетті" });
     }
 
-    const result = await sql.query`
+    const result = await pool.query`
       SELECT * FROM users WHERE email = ${email}
     `;
 
@@ -286,7 +286,7 @@ const verifyLogin2FA = async (req, res) => {
       { expiresIn: "1h" }
     );
 
-    await sql.query`
+    await pool.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
       VALUES (${user.id}, 'LOGIN_2FA', ${`2FA арқылы кіру: ${user.email}`})
     `;
