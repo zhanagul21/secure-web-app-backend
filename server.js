@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 
-const { connectDB } = require("./config/db");
+const { connectDB, ensureSchema } = require("./config/db");
 
 const authRoutes = require("./routes/authRoutes");
 const userRoutes = require("./routes/userRoutes");
@@ -33,14 +33,20 @@ app.use("/api/user", userRoutes);
 app.use("/api/documents", documentsRoutes);
 app.use("/api/logs", logsRoutes);
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
-connectDB()
-  .then(() => {
+const startServer = async () => {
+  try {
+    await connectDB();
+    await ensureSchema();
+
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running on port ${PORT}`);
     });
-  })
-  .catch((error) => {
+  } catch (error) {
     console.error("SERVER START ERROR:", error);
-  });
+    process.exit(1);
+  }
+};
+
+startServer();
