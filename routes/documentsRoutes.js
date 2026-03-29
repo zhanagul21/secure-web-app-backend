@@ -6,12 +6,14 @@ const path = require("path");
 const fs = require("fs");
 
 const { verifyToken } = require("../middleware/authMiddleware");
-const { connectDB } = require("../config/db");
+const { sql } = require("../config/db");
 const { encryptFile, decryptFile } = require("../utils/encryption");
 const { convertToPdf } = require("../utils/officeConverter");
 
 const uploadsDir = path.join(__dirname, "..", "uploads");
 const tempDir = path.join(__dirname, "..", "temp");
+
+const crypto = require("crypto");
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -89,7 +91,6 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
   try {
     const userId = req.user.id;
     const { title, category, description } = req.body;
-    const db = await connectDB();
 
     if (!title || !category) {
       return res.status(400).json({
@@ -113,8 +114,7 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
       fs.unlinkSync(originalPath);
     }
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO documents (
         user_id,
         title,
@@ -124,26 +124,21 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
         original_name,
         mime_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `,
-      [
-        userId,
-        title,
-        category,
-        description || "",
-        encryptedName,
-        req.file.originalname,
-        req.file.mimetype,
-      ]
-    );
+      VALUES (
+        ${userId},
+        ${title},
+        ${category},
+        ${description || ""},
+        ${encryptedName},
+        ${req.file.originalname},
+        ${req.file.mimetype}
+      )
+    `;
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [userId, "DOCUMENT_ADD", `Құжат қосылды: ${title}`]
-    );
+      VALUES (${userId}, 'DOCUMENT_ADD', ${`Құжат қосылды: ${title}`})
+    `;
 
     res.status(201).json({
       message: "Құжат сәтті жүктелді және шифрланды",
@@ -160,19 +155,15 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
 router.get("/my", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const db = await connectDB();
 
-    const result = await db.query(
-      `
+    const result = await sql.query`
       SELECT id, title, category, description, secret_content, original_name, mime_type, created_at
       FROM documents
-      WHERE user_id = $1
+      WHERE user_id = ${userId}
       ORDER BY id DESC
-      `,
-      [userId]
-    );
+    `;
 
-    const documentsWithSize = result.rows.map((doc) => ({
+    const documentsWithSize = result.recordset.map((doc) => ({
       ...doc,
       file_size: getFileSize(doc.secret_content),
     }));
@@ -188,19 +179,15 @@ router.get("/my", verifyToken, async (req, res) => {
 router.get("/", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const db = await connectDB();
 
-    const result = await db.query(
-      `
+    const result = await sql.query`
       SELECT id, title, category, description, secret_content, original_name, mime_type, created_at
       FROM documents
-      WHERE user_id = $1
+      WHERE user_id = ${userId}
       ORDER BY id DESC
-      `,
-      [userId]
-    );
+    `;
 
-    const documentsWithSize = result.rows.map((doc) => ({
+    const documentsWithSize = result.recordset.map((doc) => ({
       ...doc,
       file_size: getFileSize(doc.secret_content),
     }));
@@ -220,22 +207,18 @@ router.get("/view/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
-    const db = await connectDB();
 
-    const result = await db.query(
-      `
+    const result = await sql.query`
       SELECT *
       FROM documents
-      WHERE id = $1 AND user_id = $2
-      `,
-      [documentId, userId]
-    );
+      WHERE id = ${documentId} AND user_id = ${userId}
+    `;
 
-    if (result.rows.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
-    const doc = result.rows[0];
+    const doc = result.recordset[0];
 
     if (!doc.secret_content) {
       return res.status(400).json({ message: "Файл жоқ" });
@@ -263,13 +246,10 @@ router.get("/view/:id", verifyToken, async (req, res) => {
     const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
     const txtTypes = [".txt"];
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [userId, "DOCUMENT_VIEW", `Құжат қаралды: ${doc.title}`]
-    );
+      VALUES (${userId}, 'DOCUMENT_VIEW', ${`Құжат қаралды: ${doc.title}`})
+    `;
 
     if (ext === ".pdf") {
       res.setHeader("Content-Type", "application/pdf");
@@ -361,22 +341,18 @@ router.get("/download/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
-    const db = await connectDB();
 
-    const result = await db.query(
-      `
+    const result = await sql.query`
       SELECT *
       FROM documents
-      WHERE id = $1 AND user_id = $2
-      `,
-      [documentId, userId]
-    );
+      WHERE id = ${documentId} AND user_id = ${userId}
+    `;
 
-    if (result.rows.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
-    const doc = result.rows[0];
+    const doc = result.recordset[0];
 
     if (!doc.secret_content) {
       return res.status(400).json({ message: "Файл жоқ" });
@@ -391,13 +367,10 @@ router.get("/download/:id", verifyToken, async (req, res) => {
     const encryptedBuffer = fs.readFileSync(encryptedPath);
     const decryptedBuffer = decryptFile(encryptedBuffer);
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [userId, "DOCUMENT_DOWNLOAD", `Құжат жүктелді: ${doc.title}`]
-    );
+      VALUES (${userId}, 'DOCUMENT_DOWNLOAD', ${`Құжат жүктелді: ${doc.title}`})
+    `;
 
     const fileName = doc.original_name || "document";
     const mimeType = doc.mime_type || "application/octet-stream";
@@ -420,22 +393,18 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const documentId = parseInt(req.params.id, 10);
-    const db = await connectDB();
 
-    const existing = await db.query(
-      `
+    const existing = await sql.query`
       SELECT *
       FROM documents
-      WHERE id = $1 AND user_id = $2
-      `,
-      [documentId, userId]
-    );
+      WHERE id = ${documentId} AND user_id = ${userId}
+    `;
 
-    if (existing.rows.length === 0) {
+    if (existing.recordset.length === 0) {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
-    const doc = existing.rows[0];
+    const doc = existing.recordset[0];
 
     if (doc.secret_content) {
       const encryptedPath = path.join(uploadsDir, doc.secret_content);
@@ -444,26 +413,205 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
       }
     }
 
-    await db.query(
-      `
+    await sql.query`
       DELETE FROM documents
-      WHERE id = $1 AND user_id = $2
-      `,
-      [documentId, userId]
-    );
+      WHERE id = ${documentId} AND user_id = ${userId}
+    `;
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [userId, "DOCUMENT_DELETE", `Құжат өшірілді: ${doc.title}`]
-    );
+      VALUES (${userId}, 'DOCUMENT_DELETE', ${`Құжат өшірілді: ${doc.title}`})
+    `;
 
     res.json({ message: "Құжат өшірілді" });
   } catch (error) {
     console.error("DELETE DOCUMENT ERROR:", error);
     res.status(500).json({ message: "Құжатты өшіру кезінде қате шықты" });
+  }
+});
+
+// Уақытша share ссылка жасау
+router.post("/share/:id", verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const documentId = parseInt(req.params.id, 10);
+    const { durationMinutes } = req.body;
+
+    const allowedDurations = [15, 60, 480, 1440];
+    const expireMinutes = allowedDurations.includes(Number(durationMinutes))
+      ? Number(durationMinutes)
+      : 60;
+
+    const existing = await sql.query`
+      SELECT * FROM documents
+      WHERE id = ${documentId} AND user_id = ${userId}
+    `;
+
+    if (existing.recordset.length === 0) {
+      return res.status(404).json({ message: "Құжат табылмады" });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + expireMinutes * 60 * 1000);
+
+    await sql.query`
+      INSERT INTO shared_links (document_id, token, expires_at, created_by)
+      VALUES (${documentId}, ${token}, ${expiresAt}, ${userId})
+    `;
+
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    const shareUrl = `${baseUrl}/shared/${token}`;
+
+    await sql.query`
+      INSERT INTO activity_logs (user_id, action_type, action_details)
+      VALUES (${userId}, 'DOCUMENT_SHARE', ${`Ссылка жасалды: ${existing.recordset[0].title}`})
+    `;
+
+    res.json({
+      message: "Уақытша ссылка жасалды",
+      shareUrl,
+      expiresAt,
+      durationMinutes: expireMinutes,
+    });
+  } catch (error) {
+    console.error("SHARE LINK ERROR:", error);
+    res.status(500).json({ message: "Ссылка жасау кезінде қате шықты" });
+  }
+});
+
+// Share ссылка арқылы файлды ашу
+router.get("/shared/:token", async (req, res) => {
+  let tempOriginalPath = null;
+  let tempPdfPath = null;
+
+  try {
+    const { token } = req.params;
+
+    const linkResult = await sql.query`
+      SELECT sl.*, d.*
+      FROM shared_links sl
+      INNER JOIN documents d ON sl.document_id = d.id
+      WHERE sl.token = ${token}
+    `;
+
+    if (linkResult.recordset.length === 0) {
+      return res.status(404).json({ message: "Ссылка табылмады" });
+    }
+
+    const doc = linkResult.recordset[0];
+
+    if (new Date(doc.expires_at) < new Date()) {
+      return res.status(410).json({ message: "Ссылка уақыты өтіп кеткен" });
+    }
+
+    if (!doc.secret_content) {
+      return res.status(400).json({ message: "Файл жоқ" });
+    }
+
+    const encryptedPath = path.join(uploadsDir, doc.secret_content);
+
+    if (!fs.existsSync(encryptedPath)) {
+      return res.status(404).json({ message: "Файл табылмады" });
+    }
+
+    const encryptedBuffer = fs.readFileSync(encryptedPath);
+    const decryptedBuffer = decryptFile(encryptedBuffer);
+
+    const originalName = doc.original_name || "document";
+    const mimeType = doc.mime_type || "application/octet-stream";
+    const ext = path.extname(originalName).toLowerCase();
+
+    const safeFileName = `${Date.now()}-${originalName.replace(/\s+/g, "_")}`;
+    tempOriginalPath = path.join(tempDir, safeFileName);
+
+    fs.writeFileSync(tempOriginalPath, decryptedBuffer);
+
+    const imageTypes = [".jpg", ".jpeg", ".png"];
+    const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
+    const txtTypes = [".txt"];
+
+    if (ext === ".pdf") {
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${encodeURIComponent(originalName)}"`
+      );
+
+      const stream = fs.createReadStream(tempOriginalPath);
+      stream.pipe(res);
+
+      stream.on("close", () => cleanupTempFile(tempOriginalPath));
+      stream.on("error", () => cleanupTempFile(tempOriginalPath));
+      return;
+    }
+
+    if (imageTypes.includes(ext)) {
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${encodeURIComponent(originalName)}"`
+      );
+
+      const stream = fs.createReadStream(tempOriginalPath);
+      stream.pipe(res);
+
+      stream.on("close", () => cleanupTempFile(tempOriginalPath));
+      stream.on("error", () => cleanupTempFile(tempOriginalPath));
+      return;
+    }
+
+    if (txtTypes.includes(ext)) {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${encodeURIComponent(originalName)}"`
+      );
+
+      const stream = fs.createReadStream(tempOriginalPath);
+      stream.pipe(res);
+
+      stream.on("close", () => cleanupTempFile(tempOriginalPath));
+      stream.on("error", () => cleanupTempFile(tempOriginalPath));
+      return;
+    }
+
+    if (officeTypes.includes(ext)) {
+      tempPdfPath = await convertToPdf(tempOriginalPath, tempDir);
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${encodeURIComponent(
+          path.parse(originalName).name + ".pdf"
+        )}"`
+      );
+
+      const stream = fs.createReadStream(tempPdfPath);
+      stream.pipe(res);
+
+      stream.on("close", () => {
+        cleanupTempFile(tempOriginalPath);
+        cleanupTempFile(tempPdfPath);
+      });
+
+      stream.on("error", () => {
+        cleanupTempFile(tempOriginalPath);
+        cleanupTempFile(tempPdfPath);
+      });
+
+      return;
+    }
+
+    cleanupTempFile(tempOriginalPath);
+
+    return res.status(400).json({
+      message: "Бұл файл түріне preview қолдау көрсетілмейді",
+    });
+  } catch (error) {
+    console.error("SHARED VIEW ERROR:", error);
+    cleanupTempFile(tempOriginalPath);
+    cleanupTempFile(tempPdfPath);
+    res.status(500).json({ message: "Ссылка арқылы ашу кезінде қате шықты" });
   }
 });
 

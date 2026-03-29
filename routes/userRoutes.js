@@ -1,31 +1,28 @@
 const express = require("express");
 const router = express.Router();
 const { verifyToken } = require("../middleware/authMiddleware");
-const { connectDB } = require("../config/db");
+const { sql } = require("../config/db");
 const speakeasy = require("speakeasy");
 const QRCode = require("qrcode");
+const bcrypt = require("bcryptjs");
 
 // Профиль
 router.get("/profile", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const db = await connectDB();
 
-    const result = await db.query(
-      `
+    const result = await sql.query`
       SELECT id, full_name, email, role, created_at, twofa_enabled
       FROM users
-      WHERE id = $1
-      `,
-      [userId]
-    );
+      WHERE id = ${userId}
+    `;
 
-    if (result.rows.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ message: "Пайдаланушы табылмады" });
     }
 
     res.json({
-      user: result.rows[0],
+      user: result.recordset[0],
     });
   } catch (error) {
     console.error("PROFILE ERROR:", error);
@@ -40,16 +37,14 @@ router.get("/all-users", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Тек admin ғана кіре алады" });
     }
 
-    const db = await connectDB();
-
-    const result = await db.query(`
+    const result = await sql.query`
       SELECT id, full_name, email, role, created_at, twofa_enabled
       FROM users
       ORDER BY id DESC
-    `);
+    `;
 
     res.json({
-      users: result.rows,
+      users: result.recordset,
     });
   } catch (error) {
     console.error("ALL USERS ERROR:", error);
@@ -65,16 +60,12 @@ router.put("/make-admin/:id", verifyToken, async (req, res) => {
     }
 
     const id = parseInt(req.params.id, 10);
-    const db = await connectDB();
 
-    await db.query(
-      `
+    await sql.query`
       UPDATE users
       SET role = 'admin'
-      WHERE id = $1
-      `,
-      [id]
-    );
+      WHERE id = ${id}
+    `;
 
     res.json({ message: "Қолданушы admin болды" });
   } catch (error) {
@@ -91,15 +82,11 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
     }
 
     const id = parseInt(req.params.id, 10);
-    const db = await connectDB();
 
-    await db.query(
-      `
+    await sql.query`
       DELETE FROM users
-      WHERE id = $1
-      `,
-      [id]
-    );
+      WHERE id = ${id}
+    `;
 
     res.json({ message: "Қолданушы өшірілді" });
   } catch (error) {
@@ -118,16 +105,12 @@ router.get("/2fa/setup", verifyToken, async (req, res) => {
     });
 
     const qr = await QRCode.toDataURL(secret.otpauth_url);
-    const db = await connectDB();
 
-    await db.query(
-      `
+    await sql.query`
       UPDATE users
-      SET twofa_secret = $1
-      WHERE id = $2
-      `,
-      [secret.base32, req.user.id]
-    );
+      SET twofa_secret = ${secret.base32}
+      WHERE id = ${req.user.id}
+    `;
 
     res.json({
       qr: qr,
@@ -151,22 +134,17 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Код міндетті" });
     }
 
-    const db = await connectDB();
-
-    const result = await db.query(
-      `
+    const result = await sql.query`
       SELECT twofa_secret
       FROM users
-      WHERE id = $1
-      `,
-      [req.user.id]
-    );
+      WHERE id = ${req.user.id}
+    `;
 
-    if (result.rows.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ message: "Пайдаланушы табылмады" });
     }
 
-    const secret = result.rows[0].twofa_secret;
+    const secret = result.recordset[0].twofa_secret;
 
     if (!secret) {
       return res.status(400).json({ message: "Алдымен QR жасап алыңыз" });
@@ -183,27 +161,80 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Код қате" });
     }
 
-    await db.query(
-      `
+    await sql.query`
       UPDATE users
-      SET twofa_enabled = $1
-      WHERE id = $2
-      `,
-      [true, req.user.id]
-    );
+      SET twofa_enabled = 1
+      WHERE id = ${req.user.id}
+    `;
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [req.user.id, "2FA_ENABLE", "Екі факторлы аутентификация қосылды"]
-    );
+      VALUES (${req.user.id}, '2FA_ENABLE', ${"Екі факторлы аутентификация қосылды"})
+    `;
 
     res.json({ message: "2FA сәтті қосылды" });
   } catch (error) {
     console.error("2FA VERIFY ERROR:", error);
     res.status(500).json({ message: "2FA растау кезінде қате шықты" });
+  }
+});
+
+// Login кезінде QR қайта алу
+router.post("/2fa/reset-login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email мен пароль міндетті" });
+    }
+
+    const result = await sql.query`
+      SELECT * FROM users
+      WHERE email = ${email}
+    `;
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ message: "Пайдаланушы табылмады" });
+    }
+
+    const user = result.recordset[0];
+    const storedHash = user.password_hash || user.password;
+
+    if (!storedHash) {
+      return res.status(500).json({
+        message: "Пайдаланушы паролі базаға дұрыс сақталмаған",
+      });
+    }
+
+    const isMatch = await bcrypt.compare(password, storedHash);
+
+    if (!isMatch) {
+      return res.status(400).json({ message: "Қате пароль" });
+    }
+
+    const secret = speakeasy.generateSecret({
+      name: `AuthGuardLocker (${user.email})`,
+      issuer: "AuthGuardLocker",
+      length: 20,
+    });
+
+    const qr = await QRCode.toDataURL(secret.otpauth_url);
+
+    await sql.query`
+      UPDATE users
+      SET twofa_secret = ${secret.base32},
+          twofa_enabled = 0
+      WHERE id = ${user.id}
+    `;
+
+    res.json({
+      qr,
+      secret: secret.base32,
+      message: "Жаңа QR код дайын",
+    });
+  } catch (error) {
+    console.error("2FA RESET LOGIN ERROR:", error);
+    res.status(500).json({ message: "QR қайта алу кезінде қате шықты" });
   }
 });
 

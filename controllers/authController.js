@@ -1,27 +1,27 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
-const { connectDB } = require("../config/db");
+const { sql, connectDB } = require("../config/db");
 const { sendVerificationEmail } = require("../utils/sendEmail");
 
 // 1. Код жіберу
 const sendCode = async (req, res) => {
   try {
-    const db = await connectDB();
+    await connectDB();
+
     const { email } = req.body;
 
     if (!email) {
       return res.status(400).json({ message: "Email міндетті" });
     }
 
-    const existing = await db.query(
-      `SELECT * FROM users WHERE email = $1`,
-      [email]
-    );
+    const existing = await sql.query`
+      SELECT * FROM users WHERE email = ${email}
+    `;
 
     if (
-      existing.rows.length > 0 &&
-      existing.rows[0].is_verified === true
+      existing.recordset.length > 0 &&
+      existing.recordset[0].is_verified === true
     ) {
       return res.status(400).json({ message: "Бұл email бұрын тіркелген" });
     }
@@ -29,19 +29,15 @@ const sendCode = async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    if (existing.rows.length > 0) {
-      await db.query(
-        `
+    if (existing.recordset.length > 0) {
+      await sql.query`
         UPDATE users
-        SET verification_code = $1,
-            code_expires_at = $2
-        WHERE email = $3
-        `,
-        [code, expiresAt, email]
-      );
+        SET verification_code = ${code},
+            code_expires_at = ${expiresAt}
+        WHERE email = ${email}
+      `;
     } else {
-      await db.query(
-        `
+      await sql.query`
         INSERT INTO users (
           full_name,
           email,
@@ -51,10 +47,16 @@ const sendCode = async (req, res) => {
           verification_code,
           code_expires_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        `,
-        ["", email, "", "user", false, code, expiresAt]
-      );
+        VALUES (
+          ${""},
+          ${email},
+          ${""},
+          ${"user"},
+          ${false},
+          ${code},
+          ${expiresAt}
+        )
+      `;
     }
 
     await sendVerificationEmail(email, code);
@@ -69,19 +71,19 @@ const sendCode = async (req, res) => {
 // 2. Кодты тексеру
 const verifyCode = async (req, res) => {
   try {
-    const db = await connectDB();
+    await connectDB();
+
     const { email, code } = req.body;
 
     if (!email || !code) {
       return res.status(400).json({ message: "Email және код міндетті" });
     }
 
-    const result = await db.query(
-      `SELECT * FROM users WHERE email = $1`,
-      [email]
-    );
+    const result = await sql.query`
+      SELECT * FROM users WHERE email = ${email}
+    `;
 
-    const user = result.rows[0];
+    const user = result.recordset[0];
 
     if (!user) {
       return res.status(404).json({ message: "Пайдаланушы табылмады" });
@@ -105,19 +107,19 @@ const verifyCode = async (req, res) => {
 // 3. Тіркелуді аяқтау
 const completeRegister = async (req, res) => {
   try {
-    const db = await connectDB();
+    await connectDB();
+
     const { full_name, email, password } = req.body;
 
     if (!full_name || !email || !password) {
       return res.status(400).json({ message: "Барлық өрістер міндетті" });
     }
 
-    const result = await db.query(
-      `SELECT * FROM users WHERE email = $1`,
-      [email]
-    );
+    const result = await sql.query`
+      SELECT * FROM users WHERE email = ${email}
+    `;
 
-    const user = result.rows[0];
+    const user = result.recordset[0];
 
     if (!user) {
       return res.status(404).json({ message: "Алдымен код сұратыңыз" });
@@ -129,18 +131,15 @@ const completeRegister = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    await db.query(
-      `
+    await sql.query`
       UPDATE users
-      SET full_name = $1,
-          password_hash = $2,
-          is_verified = $3,
-          verification_code = $4,
-          code_expires_at = $5
-      WHERE email = $6
-      `,
-      [full_name, hashedPassword, true, null, null, email]
-    );
+      SET full_name = ${full_name},
+          password_hash = ${hashedPassword},
+          is_verified = ${true},
+          verification_code = ${null},
+          code_expires_at = ${null}
+      WHERE email = ${email}
+    `;
 
     res.json({ message: "Тіркелу сәтті аяқталды" });
   } catch (error) {
@@ -152,31 +151,23 @@ const completeRegister = async (req, res) => {
 // 4. Login
 const login = async (req, res) => {
   try {
-    const db = await connectDB();
-    const { email, password } = req.body;
+    await connectDB();
 
-    console.log("LOGIN REQUEST EMAIL:", email);
+    const { email, password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ message: "Email және пароль міндетті" });
     }
 
-    const result = await db.query(
-      `SELECT * FROM users WHERE email = $1`,
-      [email]
-    );
+    const result = await sql.query`
+      SELECT * FROM users WHERE email = ${email}
+    `;
 
-    const user = result.rows[0];
-
-    console.log("FOUND USER:", !!user);
+    const user = result.recordset[0];
 
     if (!user) {
       return res.status(400).json({ message: "Қате email немесе пароль" });
     }
-
-    console.log("USER VERIFIED:", user.is_verified);
-    console.log("HAS PASSWORD_HASH:", !!user.password_hash);
-    console.log("HAS PASSWORD:", !!user.password);
 
     const storedHash = user.password_hash || user.password;
 
@@ -191,8 +182,6 @@ const login = async (req, res) => {
     }
 
     const isMatch = await bcrypt.compare(password, storedHash);
-
-    console.log("PASSWORD MATCH:", isMatch);
 
     if (!isMatch) {
       return res.status(400).json({ message: "Қате email немесе пароль" });
@@ -220,13 +209,10 @@ const login = async (req, res) => {
       { expiresIn: "1h" }
     );
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [user.id, "LOGIN", `Кіру орындалды: ${user.email}`]
-    );
+      VALUES (${user.id}, 'LOGIN', ${`Кіру орындалды: ${user.email}`})
+    `;
 
     res.json({
       message: "Кіру сәтті орындалды",
@@ -247,19 +233,19 @@ const login = async (req, res) => {
 // 5. Login үшін 2FA растау
 const verifyLogin2FA = async (req, res) => {
   try {
-    const db = await connectDB();
+    await connectDB();
+
     const { email, token: twofaCode } = req.body;
 
     if (!email || !twofaCode) {
       return res.status(400).json({ message: "Email және 2FA коды міндетті" });
     }
 
-    const result = await db.query(
-      `SELECT * FROM users WHERE email = $1`,
-      [email]
-    );
+    const result = await sql.query`
+      SELECT * FROM users WHERE email = ${email}
+    `;
 
-    const user = result.rows[0];
+    const user = result.recordset[0];
 
     if (!user) {
       return res.status(404).json({ message: "Пайдаланушы табылмады" });
@@ -290,13 +276,10 @@ const verifyLogin2FA = async (req, res) => {
       { expiresIn: "1h" }
     );
 
-    await db.query(
-      `
+    await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES ($1, $2, $3)
-      `,
-      [user.id, "LOGIN_2FA", `2FA арқылы кіру: ${user.email}`]
-    );
+      VALUES (${user.id}, 'LOGIN_2FA', ${`2FA арқылы кіру: ${user.email}`})
+    `;
 
     res.json({
       message: "2FA арқылы кіру сәтті орындалды",
