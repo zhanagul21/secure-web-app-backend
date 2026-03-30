@@ -1,14 +1,12 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
-const { sql, connectDB } = require("../config/db");
+const { sql } = require("../config/db");
 const { sendVerificationEmail } = require("../utils/sendEmail");
 
-// 1. Код жіберу
+// SEND CODE
 const sendCode = async (req, res) => {
   try {
-    await connectDB();
-
     const { email } = req.body;
 
     if (!email) {
@@ -19,10 +17,7 @@ const sendCode = async (req, res) => {
       SELECT * FROM users WHERE email = ${email}
     `;
 
-    if (
-      existing.recordset.length > 0 &&
-      existing.recordset[0].is_verified === true
-    ) {
+    if (existing.recordset.length > 0 && existing.recordset[0].is_verified) {
       return res.status(400).json({ message: "Бұл email бұрын тіркелген" });
     }
 
@@ -38,46 +33,24 @@ const sendCode = async (req, res) => {
       `;
     } else {
       await sql.query`
-        INSERT INTO users (
-          full_name,
-          email,
-          password_hash,
-          role,
-          is_verified,
-          verification_code,
-          code_expires_at
-        )
-        VALUES (
-          ${""},
-          ${email},
-          ${""},
-          ${"user"},
-          ${false},
-          ${code},
-          ${expiresAt}
-        )
+        INSERT INTO users (full_name, email, password_hash, role, is_verified, verification_code, code_expires_at)
+        VALUES (${""}, ${email}, ${""}, ${"user"}, ${false}, ${code}, ${expiresAt})
       `;
     }
 
     await sendVerificationEmail(email, code);
 
-    res.json({ message: "Растау коды email-ға жіберілді" });
+    res.json({ message: "Код жіберілді" });
   } catch (error) {
-    console.error("Send code error:", error);
-    res.status(500).json({ message: "Код жіберу кезінде қате шықты" });
+    console.error(error);
+    res.status(500).json({ message: "Қате" });
   }
 };
 
-// 2. Кодты тексеру
+// VERIFY CODE
 const verifyCode = async (req, res) => {
   try {
-    await connectDB();
-
     const { email, code } = req.body;
-
-    if (!email || !code) {
-      return res.status(400).json({ message: "Email және код міндетті" });
-    }
 
     const result = await sql.query`
       SELECT * FROM users WHERE email = ${email}
@@ -85,35 +58,26 @@ const verifyCode = async (req, res) => {
 
     const user = result.recordset[0];
 
-    if (!user) {
-      return res.status(404).json({ message: "Пайдаланушы табылмады" });
-    }
+    if (!user) return res.status(404).json({ message: "Табылмады" });
 
     if (user.verification_code !== code) {
       return res.status(400).json({ message: "Код қате" });
     }
 
     if (user.code_expires_at && new Date(user.code_expires_at) < new Date()) {
-      return res.status(400).json({ message: "Код уақыты өтіп кеткен" });
+      return res.status(400).json({ message: "Код уақыты өтті" });
     }
 
-    res.json({ message: "Код расталды" });
-  } catch (error) {
-    console.error("Verify code error:", error);
-    res.status(500).json({ message: "Сервер қатесі" });
+    res.json({ message: "OK" });
+  } catch (e) {
+    res.status(500).json({ message: "Қате" });
   }
 };
 
-// 3. Тіркелуді аяқтау
+// COMPLETE REGISTER
 const completeRegister = async (req, res) => {
   try {
-    await connectDB();
-
     const { full_name, email, password } = req.body;
-
-    if (!full_name || !email || !password) {
-      return res.status(400).json({ message: "Барлық өрістер міндетті" });
-    }
 
     const result = await sql.query`
       SELECT * FROM users WHERE email = ${email}
@@ -121,43 +85,30 @@ const completeRegister = async (req, res) => {
 
     const user = result.recordset[0];
 
-    if (!user) {
-      return res.status(404).json({ message: "Алдымен код сұратыңыз" });
-    }
+    if (!user) return res.status(404).json({ message: "Табылмады" });
 
-    if (!user.verification_code && user.is_verified !== true) {
-      return res.status(400).json({ message: "Код расталмаған" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hash = await bcrypt.hash(password, 10);
 
     await sql.query`
       UPDATE users
       SET full_name = ${full_name},
-          password_hash = ${hashedPassword},
+          password_hash = ${hash},
           is_verified = ${true},
           verification_code = ${null},
           code_expires_at = ${null}
       WHERE email = ${email}
     `;
 
-    res.json({ message: "Тіркелу сәтті аяқталды" });
-  } catch (error) {
-    console.error("Complete register error:", error);
-    res.status(500).json({ message: "Сервер қатесі" });
+    res.json({ message: "Тіркелді" });
+  } catch {
+    res.status(500).json({ message: "Қате" });
   }
 };
 
-// 4. Login
+// LOGIN
 const login = async (req, res) => {
   try {
-    await connectDB();
-
     const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ message: "Email және пароль міндетті" });
-    }
 
     const result = await sql.query`
       SELECT * FROM users WHERE email = ${email}
@@ -169,19 +120,11 @@ const login = async (req, res) => {
       return res.status(400).json({ message: "Қате email немесе пароль" });
     }
 
-    const storedHash = user.password_hash || user.password;
-
-    if (!storedHash) {
-      return res.status(500).json({
-        message: "Пайдаланушы паролі базаға дұрыс сақталмаған",
-      });
-    }
-
     if (!user.is_verified) {
       return res.status(403).json({ message: "Аккаунт расталмаған" });
     }
 
-    const isMatch = await bcrypt.compare(password, storedHash);
+    const isMatch = await bcrypt.compare(password, user.password_hash);
 
     if (!isMatch) {
       return res.status(400).json({ message: "Қате email немесе пароль" });
@@ -190,32 +133,17 @@ const login = async (req, res) => {
     if (user.twofa_enabled) {
       return res.json({
         requires2fa: true,
-        message: "2FA кодын енгізіңіз",
-        tempUser: {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-        },
+        email: user.email,
       });
     }
 
     const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-      },
+      { id: user.id, email: user.email, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 
-    await sql.query`
-      INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${user.id}, 'LOGIN', ${`Кіру орындалды: ${user.email}`})
-    `;
-
     res.json({
-      message: "Кіру сәтті орындалды",
       token,
       user: {
         id: user.id,
@@ -225,21 +153,15 @@ const login = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ message: "Сервер қатесі" });
+    console.error(error);
+    res.status(500).json({ message: "Server error" });
   }
 };
 
-// 5. Login үшін 2FA растау
+// 2FA LOGIN
 const verifyLogin2FA = async (req, res) => {
   try {
-    await connectDB();
-
-    const { email, token: twofaCode } = req.body;
-
-    if (!email || !twofaCode) {
-      return res.status(400).json({ message: "Email және 2FA коды міндетті" });
-    }
+    const { email, token } = req.body;
 
     const result = await sql.query`
       SELECT * FROM users WHERE email = ${email}
@@ -247,53 +169,26 @@ const verifyLogin2FA = async (req, res) => {
 
     const user = result.recordset[0];
 
-    if (!user) {
-      return res.status(404).json({ message: "Пайдаланушы табылмады" });
-    }
-
-    if (!user.twofa_enabled || !user.twofa_secret) {
-      return res.status(400).json({ message: "2FA қосылмаған" });
-    }
-
     const verified = speakeasy.totp.verify({
       secret: user.twofa_secret,
       encoding: "base32",
-      token: twofaCode,
+      token,
       window: 1,
     });
 
     if (!verified) {
-      return res.status(400).json({ message: "2FA коды қате" });
+      return res.status(400).json({ message: "Қате код" });
     }
 
     const jwtToken = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-      },
+      { id: user.id, email: user.email, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: "1h" }
     );
 
-    await sql.query`
-      INSERT INTO activity_logs (user_id, action_type, action_details)
-      VALUES (${user.id}, 'LOGIN_2FA', ${`2FA арқылы кіру: ${user.email}`})
-    `;
-
-    res.json({
-      message: "2FA арқылы кіру сәтті орындалды",
-      token: jwtToken,
-      user: {
-        id: user.id,
-        full_name: user.full_name,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (error) {
-    console.error("Verify login 2FA error:", error);
-    res.status(500).json({ message: "Сервер қатесі" });
+    res.json({ token: jwtToken });
+  } catch {
+    res.status(500).json({ message: "Қате" });
   }
 };
 
