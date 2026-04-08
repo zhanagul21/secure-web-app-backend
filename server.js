@@ -20,23 +20,29 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 const corsOptions = {
-  origin: function (origin, callback) {
+  origin: (origin, callback) => {
+    console.log("Incoming Origin:", origin);
+
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
       console.log("CORS blocked:", origin);
-      callback(new Error("CORS blocked: " + origin));
+      callback(null, false);
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "ngrok-skip-browser-warning"],
   credentials: true,
+  optionsSuccessStatus: 200,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
+
 app.use(express.json());
 
 app.get("/", (req, res) => {
@@ -58,6 +64,7 @@ connectDB()
   .then(() => {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running on port ${PORT}`);
+      console.log("Allowed origins:", allowedOrigins);
     });
   })
   .catch((error) => {
