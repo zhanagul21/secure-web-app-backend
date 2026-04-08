@@ -2,9 +2,8 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
 const { sql } = require("../config/db");
-const { sendVerificationEmail } = require("../utils/sendEmail");
 
-// SEND CODE
+// SEND CODE - уақытша fake success
 const sendCode = async (req, res) => {
   try {
     const { email } = req.body;
@@ -21,91 +20,65 @@ const sendCode = async (req, res) => {
       return res.status(400).json({ message: "Бұл email бұрын тіркелген" });
     }
 
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-    if (existing.recordset.length > 0) {
-      await sql.query`
-        UPDATE users
-        SET verification_code = ${code},
-            code_expires_at = ${expiresAt}
-        WHERE email = ${email}
-      `;
-    } else {
-      await sql.query`
-        INSERT INTO users (full_name, email, password_hash, role, is_verified, verification_code, code_expires_at)
-        VALUES (${""}, ${email}, ${""}, ${"user"}, ${false}, ${code}, ${expiresAt})
-      `;
-    }
-
-    await sendVerificationEmail(email, code);
-
-    res.json({ message: "Код жіберілді" });
+    // Email жібермейміз, тек success қайтарамыз
+    return res.json({ message: "Код жіберілді" });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Қате" });
+    console.error("SEND CODE ERROR:", error);
+    return res.status(500).json({ message: "Қате" });
   }
 };
 
-// VERIFY CODE
+// VERIFY CODE - уақытша always success
 const verifyCode = async (req, res) => {
   try {
-    const { email, code } = req.body;
-
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${email}
-    `;
-
-    const user = result.recordset[0];
-
-    if (!user) return res.status(404).json({ message: "Табылмады" });
-
-    if (user.verification_code !== code) {
-      return res.status(400).json({ message: "Код қате" });
-    }
-
-    if (user.code_expires_at && new Date(user.code_expires_at) < new Date()) {
-      return res.status(400).json({ message: "Код уақыты өтті" });
-    }
-
-    res.json({ message: "OK" });
+    return res.json({ message: "OK" });
   } catch (e) {
-    res.status(500).json({ message: "Қате" });
+    return res.status(500).json({ message: "Қате" });
   }
 };
 
-// COMPLETE REGISTER
+// COMPLETE REGISTER - бірден verified қылып тіркейді
 const completeRegister = async (req, res) => {
   try {
     const { full_name, email, password } = req.body;
 
+    if (!full_name || !email || !password) {
+      return res.status(400).json({ message: "Барлық өрістерді толтырыңыз" });
+    }
+
     const result = await sql.query`
       SELECT * FROM users WHERE email = ${email}
     `;
 
     const user = result.recordset[0];
-
-    if (!user) return res.status(404).json({ message: "Табылмады" });
-
     const hash = await bcrypt.hash(password, 10);
 
-    await sql.query`
-      UPDATE users
-      SET full_name = ${full_name},
-          password_hash = ${hash},
-          is_verified = ${true},
-          verification_code = ${null},
-          code_expires_at = ${null}
-      WHERE email = ${email}
-    `;
+    if (!user) {
+      await sql.query`
+        INSERT INTO users (full_name, email, password_hash, role, is_verified)
+        VALUES (${full_name}, ${email}, ${hash}, ${"user"}, ${true})
+      `;
+    } else {
+      await sql.query`
+        UPDATE users
+        SET full_name = ${full_name},
+            password_hash = ${hash},
+            role = ${"user"},
+            is_verified = ${true},
+            verification_code = ${null},
+            code_expires_at = ${null}
+        WHERE email = ${email}
+      `;
+    }
 
-    res.json({ message: "Тіркелді" });
-  } catch {
-    res.status(500).json({ message: "Қате" });
+    return res.json({ message: "Тіркелді" });
+  } catch (error) {
+    console.error("COMPLETE REGISTER ERROR:", error);
+    return res.status(500).json({ message: "Қате" });
   }
 };
 
-// LOGIN
+// LOGIN - is_verified тексермейміз
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -120,11 +93,7 @@ const login = async (req, res) => {
       return res.status(400).json({ message: "Қате email немесе пароль" });
     }
 
-    if (!user.is_verified) {
-      return res.status(403).json({ message: "Аккаунт расталмаған" });
-    }
-
-    const isMatch = await bcrypt.compare(password, user.password_hash);
+    const isMatch = await bcrypt.compare(password, user.password_hash || "");
 
     if (!isMatch) {
       return res.status(400).json({ message: "Қате email немесе пароль" });
@@ -143,7 +112,7 @@ const login = async (req, res) => {
       { expiresIn: "1h" }
     );
 
-    res.json({
+    return res.json({
       token,
       user: {
         id: user.id,
@@ -153,8 +122,8 @@ const login = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Server error" });
+    console.error("LOGIN ERROR:", error);
+    return res.status(500).json({ message: "Server error" });
   }
 };
 
@@ -186,9 +155,10 @@ const verifyLogin2FA = async (req, res) => {
       { expiresIn: "1h" }
     );
 
-    res.json({ token: jwtToken });
-  } catch {
-    res.status(500).json({ message: "Қате" });
+    return res.json({ token: jwtToken });
+  } catch (error) {
+    console.error("2FA ERROR:", error);
+    return res.status(500).json({ message: "Қате" });
   }
 };
 
