@@ -4,15 +4,19 @@ const router = express.Router();
 const {
   sendCode,
   verifyCode,
-  completeRegister,
+  register,
   login,
-  verifyLogin2FA,
+  verify2FA,
+  forgotPassword,
+  resetPassword,
 } = require("../controllers/authController");
 
 router.post("/send-code", sendCode);
 router.post("/verify-code", verifyCode);
-router.post("/complete-register", completeRegister);
+router.post("/register", register);
 router.post("/login", login);
-router.post("/login-2fa", verifyLogin2FA);
+router.post("/verify-2fa", verify2FA);
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
 
 module.exports = router;

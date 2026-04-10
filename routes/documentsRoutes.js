@@ -4,16 +4,14 @@ const router = express.Router();
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 
 const { verifyToken } = require("../middleware/authMiddleware");
 const { sql } = require("../config/db");
 const { encryptFile, decryptFile } = require("../utils/encryption");
-const { convertToPdf } = require("../utils/officeConverter");
 
 const uploadsDir = path.join(__dirname, "..", "uploads");
 const tempDir = path.join(__dirname, "..", "temp");
-
-const crypto = require("crypto");
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -28,7 +26,7 @@ const storage = multer.diskStorage({
     cb(null, tempDir);
   },
   filename: function (req, file, cb) {
-    const safeName = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
+    const safeName = `${Date.now()}-${file.originalname.replace(/\s+/g, "_")}`;
     cb(null, safeName);
   },
 });
@@ -47,6 +45,7 @@ const allowedTypes = [
 
 const upload = multer({
   storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
@@ -86,7 +85,6 @@ function getFileSize(secretContent) {
   }
 }
 
-// Құжат қосу
 router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
   try {
     const userId = req.user.id;
@@ -103,16 +101,14 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
     }
 
     const originalPath = req.file.path;
-    const encryptedName = req.file.filename + ".enc";
+    const encryptedName = `${req.file.filename}.enc`;
     const encryptedPath = path.join(uploadsDir, encryptedName);
 
     const fileBuffer = fs.readFileSync(originalPath);
     const encryptedBuffer = encryptFile(fileBuffer);
     fs.writeFileSync(encryptedPath, encryptedBuffer);
 
-    if (fs.existsSync(originalPath)) {
-      fs.unlinkSync(originalPath);
-    }
+    cleanupTempFile(originalPath);
 
     await sql.query`
       INSERT INTO documents (
@@ -151,7 +147,6 @@ router.post("/add", verifyToken, upload.single("file"), async (req, res) => {
   }
 });
 
-// Өз құжаттарын көру
 router.get("/my", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -175,7 +170,6 @@ router.get("/my", verifyToken, async (req, res) => {
   }
 });
 
-// Dashboard preview
 router.get("/", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -199,10 +193,8 @@ router.get("/", verifyToken, async (req, res) => {
   }
 });
 
-// Құжатты сайт ішінде ашу
 router.get("/view/:id", verifyToken, async (req, res) => {
   let tempOriginalPath = null;
-  let tempPdfPath = null;
 
   try {
     const userId = req.user.id;
@@ -239,12 +231,11 @@ router.get("/view/:id", verifyToken, async (req, res) => {
 
     const safeFileName = `${Date.now()}-${originalName.replace(/\s+/g, "_")}`;
     tempOriginalPath = path.join(tempDir, safeFileName);
-
     fs.writeFileSync(tempOriginalPath, decryptedBuffer);
 
-    const imageTypes = [".jpg", ".jpeg", ".png"];
-    const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
+    const imageTypes = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
     const txtTypes = [".txt"];
+    const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
 
     await sql.query`
       INSERT INTO activity_logs (user_id, action_type, action_details)
@@ -297,30 +288,12 @@ router.get("/view/:id", verifyToken, async (req, res) => {
     }
 
     if (officeTypes.includes(ext)) {
-      tempPdfPath = await convertToPdf(tempOriginalPath, tempDir);
+      cleanupTempFile(tempOriginalPath);
 
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader(
-        "Content-Disposition",
-        `inline; filename="${encodeURIComponent(
-          path.parse(originalName).name + ".pdf"
-        )}"`
-      );
-
-      const stream = fs.createReadStream(tempPdfPath);
-      stream.pipe(res);
-
-      stream.on("close", () => {
-        cleanupTempFile(tempOriginalPath);
-        cleanupTempFile(tempPdfPath);
+      return res.status(400).json({
+        message:
+          "Office файлдарын сайт ішінде preview ету әзірге қолдау көрсетілмейді. Файлды жүктеп алып ашыңыз.",
       });
-
-      stream.on("error", () => {
-        cleanupTempFile(tempOriginalPath);
-        cleanupTempFile(tempPdfPath);
-      });
-
-      return;
     }
 
     cleanupTempFile(tempOriginalPath);
@@ -331,12 +304,10 @@ router.get("/view/:id", verifyToken, async (req, res) => {
   } catch (error) {
     console.error("VIEW DOCUMENT ERROR:", error);
     cleanupTempFile(tempOriginalPath);
-    cleanupTempFile(tempPdfPath);
     res.status(500).json({ message: "Құжатты ашу кезінде қате шықты" });
   }
 });
 
-// Құжатты download ету
 router.get("/download/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -388,7 +359,6 @@ router.get("/download/:id", verifyToken, async (req, res) => {
   }
 });
 
-// Құжат өшіру
 router.delete("/delete/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -430,7 +400,6 @@ router.delete("/delete/:id", verifyToken, async (req, res) => {
   }
 });
 
-// Уақытша share ссылка жасау
 router.post("/share/:id", verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -443,7 +412,8 @@ router.post("/share/:id", verifyToken, async (req, res) => {
       : 60;
 
     const existing = await sql.query`
-      SELECT * FROM documents
+      SELECT *
+      FROM documents
       WHERE id = ${documentId} AND user_id = ${userId}
     `;
 
@@ -479,16 +449,14 @@ router.post("/share/:id", verifyToken, async (req, res) => {
   }
 });
 
-// Share ссылка арқылы файлды ашу
 router.get("/shared/:token", async (req, res) => {
   let tempOriginalPath = null;
-  let tempPdfPath = null;
 
   try {
     const { token } = req.params;
 
     const linkResult = await sql.query`
-      SELECT sl.*, d.*
+      SELECT sl.expires_at, d.*
       FROM shared_links sl
       INNER JOIN documents d ON sl.document_id = d.id
       WHERE sl.token = ${token}
@@ -523,12 +491,11 @@ router.get("/shared/:token", async (req, res) => {
 
     const safeFileName = `${Date.now()}-${originalName.replace(/\s+/g, "_")}`;
     tempOriginalPath = path.join(tempDir, safeFileName);
-
     fs.writeFileSync(tempOriginalPath, decryptedBuffer);
 
-    const imageTypes = [".jpg", ".jpeg", ".png"];
-    const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
+    const imageTypes = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
     const txtTypes = [".txt"];
+    const officeTypes = [".doc", ".docx", ".ppt", ".pptx"];
 
     if (ext === ".pdf") {
       res.setHeader("Content-Type", "application/pdf");
@@ -576,30 +543,12 @@ router.get("/shared/:token", async (req, res) => {
     }
 
     if (officeTypes.includes(ext)) {
-      tempPdfPath = await convertToPdf(tempOriginalPath, tempDir);
+      cleanupTempFile(tempOriginalPath);
 
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader(
-        "Content-Disposition",
-        `inline; filename="${encodeURIComponent(
-          path.parse(originalName).name + ".pdf"
-        )}"`
-      );
-
-      const stream = fs.createReadStream(tempPdfPath);
-      stream.pipe(res);
-
-      stream.on("close", () => {
-        cleanupTempFile(tempOriginalPath);
-        cleanupTempFile(tempPdfPath);
+      return res.status(400).json({
+        message:
+          "Office файлдарын ссылка арқылы preview ету әзірге қолдау көрсетілмейді. Файлды жүктеп алып ашыңыз.",
       });
-
-      stream.on("error", () => {
-        cleanupTempFile(tempOriginalPath);
-        cleanupTempFile(tempPdfPath);
-      });
-
-      return;
     }
 
     cleanupTempFile(tempOriginalPath);
@@ -610,7 +559,6 @@ router.get("/shared/:token", async (req, res) => {
   } catch (error) {
     console.error("SHARED VIEW ERROR:", error);
     cleanupTempFile(tempOriginalPath);
-    cleanupTempFile(tempPdfPath);
     res.status(500).json({ message: "Ссылка арқылы ашу кезінде қате шықты" });
   }
 });
