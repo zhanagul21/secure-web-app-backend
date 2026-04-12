@@ -50,9 +50,12 @@ const authMiddleware = (req, res, next) => {
 };
 
 const getLibreOfficeExecutable = () => {
-  if (process.env.LIBREOFFICE_PATH) {
-    return process.env.LIBREOFFICE_PATH;
+  const configuredPath = process.env.LIBREOFFICE_PATH;
+
+  if (configuredPath && (process.platform === "win32" || !configuredPath.includes(":\\"))) {
+    return configuredPath;
   }
+
   return process.platform === "win32" ? "soffice.exe" : "soffice";
 };
 
