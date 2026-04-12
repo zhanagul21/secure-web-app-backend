@@ -1,5 +1,13 @@
 const sql = require("mssql");
 
+const parseBoolean = (value, fallback) => {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  return value === "true";
+};
+
 const config = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
@@ -7,8 +15,11 @@ const config = {
   database: process.env.DB_NAME,
   port: parseInt(process.env.DB_PORT || "1433", 10),
   options: {
-    encrypt: false,
-    trustServerCertificate: true,
+    encrypt: parseBoolean(process.env.DB_ENCRYPT, false),
+    trustServerCertificate: parseBoolean(
+      process.env.DB_TRUST_SERVER_CERTIFICATE,
+      true
+    ),
   },
 };
 

@@ -1,16 +1,8 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
-const nodemailer = require("nodemailer");
 const { sql, pool, poolConnect } = require("../config/db");
-
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-});
+const { sendMail } = require("../utils/sendEmail");
 
 async function logActivity(userId, actionType, actionDetails) {
   try {
@@ -41,19 +33,23 @@ function signToken(user) {
       id: user.id,
       email: user.email,
       role: user.role || "user",
+      type: "access",
     },
     process.env.JWT_SECRET,
     { expiresIn: "7d" }
   );
 }
 
-async function sendMail(to, subject, html) {
-  await transporter.sendMail({
-    from: `"AuthGuard Locker" <${process.env.GMAIL_USER}>`,
-    to,
-    subject,
-    html,
-  });
+function signTemp2FAToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      type: "2fa_pending",
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: "5m" }
+  );
 }
 
 const sendCode = async (req, res) => {
@@ -338,9 +334,11 @@ const login = async (req, res) => {
     }
 
     if (user.twofa_enabled && user.twofa_secret) {
+      const tempToken = signTemp2FAToken(user);
+
       return res.json({
         requires2fa: true,
-        email: user.email,
+        tempToken,
         message: "2FA кодын енгізіңіз",
       });
     }
@@ -370,23 +368,33 @@ const login = async (req, res) => {
 
 const verify2FA = async (req, res) => {
   try {
-    const { email, token } = req.body;
+    const { tempToken, token } = req.body;
 
-    if (!email || !token) {
-      return res.status(400).json({ message: "Email мен 2FA коды міндетті" });
+    if (!tempToken || !token) {
+      return res.status(400).json({ message: "2FA деректері жетіспейді" });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    let decoded;
+
+    try {
+      decoded = jwt.verify(tempToken, process.env.JWT_SECRET);
+    } catch (error) {
+      return res.status(401).json({ message: "2FA сессиясының уақыты өтіп кеткен" });
+    }
+
+    if (decoded.type !== "2fa_pending") {
+      return res.status(401).json({ message: "Жарамсыз 2FA сессиясы" });
+    }
 
     await poolConnect;
 
     const result = await pool
       .request()
-      .input("email", sql.NVarChar(255), normalizedEmail)
+      .input("id", sql.Int, decoded.id)
       .query(`
         SELECT TOP 1 *
         FROM users
-        WHERE email = @email
+        WHERE id = @id
       `);
 
     const user = result.recordset[0];
