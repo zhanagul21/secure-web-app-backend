@@ -344,6 +344,37 @@ router.post("/2fa/verify", verifyToken, async (req, res) => {
   }
 });
 
+router.post("/2fa/disable", verifyToken, async (req, res) => {
+  try {
+    await poolConnect;
+
+    await pool
+      .request()
+      .input("userId", sql.Int, req.user.id)
+      .query(`
+        UPDATE users
+        SET twofa_secret = NULL,
+            twofa_enabled = 0
+        WHERE id = @userId
+      `);
+
+    await pool
+      .request()
+      .input("userId", sql.Int, req.user.id)
+      .input("actionType", sql.NVarChar(100), "2FA_DISABLE")
+      .input("actionDetails", sql.NVarChar(sql.MAX), "Екі факторлы аутентификация өшірілді")
+      .query(`
+        INSERT INTO activity_logs (user_id, action_type, action_details, created_at)
+        VALUES (@userId, @actionType, @actionDetails, GETDATE())
+      `);
+
+    res.json({ message: "2FA өшірілді" });
+  } catch (error) {
+    console.error("2FA DISABLE ERROR:", error);
+    res.status(500).json({ message: "2FA өшіру кезінде қате шықты" });
+  }
+});
+
 router.post("/2fa/reset-login", async (req, res) => {
   try {
     const { email, password } = req.body;
