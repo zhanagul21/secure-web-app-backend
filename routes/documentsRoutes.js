@@ -38,7 +38,10 @@ if (!fs.existsSync(uploadsDir)) {
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
-    const safeOriginalName = file.originalname.replace(/[^\w.\-() ]/g, "_");
+    const normalizedOriginalName = Buffer.from(file.originalname, "latin1").toString(
+      "utf8"
+    );
+    const safeOriginalName = normalizedOriginalName.replace(/[^\w.\-() ]/g, "_");
     cb(null, `${Date.now()}-${safeOriginalName}`);
   },
 });
@@ -181,7 +184,8 @@ const getDocumentMetaByIdForUser = async (documentId, userId) => {
 
 const writeTempDocumentFile = (doc, buffer) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "authguard-preview-"));
-  const safeOriginalName = path.basename(doc.original_name || doc.filename || "document");
+  const extension = path.extname(doc.original_name || doc.filename || ".bin") || ".bin";
+  const safeOriginalName = `document${extension}`;
   const tempPath = path.join(tempDir, safeOriginalName);
 
   fs.writeFileSync(tempPath, buffer);
@@ -301,6 +305,10 @@ router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => 
 
     await poolConnect;
 
+    const normalizedOriginalName = Buffer.from(req.file.originalname, "latin1").toString(
+      "utf8"
+    );
+
     const addRequest = pool
       .request()
       .input("userId", sql.Int, req.user.id)
@@ -308,7 +316,7 @@ router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => 
       .input("category", sql.NVarChar(255), category.trim())
       .input("description", sql.NVarChar(sql.MAX), description || "")
       .input("filename", sql.NVarChar(500), req.file.filename)
-      .input("originalName", sql.NVarChar(500), req.file.originalname)
+      .input("originalName", sql.NVarChar(500), normalizedOriginalName)
       .input("mimeType", sql.NVarChar(255), req.file.mimetype)
       .input("fileSize", sql.Int, req.file.size);
 
@@ -420,7 +428,7 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
       doc.mime_type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ) {
-      const result = await mammoth.convertToHtml({ path: readable.filePath });
+      const result = await mammoth.convertToHtml({ buffer: readable.buffer });
 
       return res.send(`
         <html>
@@ -685,7 +693,7 @@ router.get("/shared/:token", async (req, res) => {
       doc.mime_type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ) {
-      const resultHtml = await mammoth.convertToHtml({ path: readable.filePath });
+      const resultHtml = await mammoth.convertToHtml({ buffer: readable.buffer });
 
       return res.send(`
         <html>
