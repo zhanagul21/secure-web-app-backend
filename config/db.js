@@ -117,8 +117,14 @@ const createPostgresAdapter = () => {
         original_name VARCHAR(500),
         mime_type VARCHAR(255),
         file_size INTEGER,
+        file_data BYTEA,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
+    `);
+
+    await pgPool.query(`
+      ALTER TABLE documents
+      ADD COLUMN IF NOT EXISTS file_data BYTEA
     `);
 
     await pgPool.query(`

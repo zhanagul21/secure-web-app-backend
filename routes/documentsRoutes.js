@@ -15,6 +15,8 @@ const { encryptFile, decryptFile, isEncryptedFile } = require("../utils/encrypti
 const execFileAsync = promisify(execFile);
 
 const uploadsDir = path.resolve(process.env.UPLOADS_DIR || "./uploads");
+const storeFilesInDatabase =
+  Boolean(process.env.DATABASE_URL) && process.env.DB_DRIVER !== "mssql";
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -126,6 +128,24 @@ const getDocumentByIdForUser = async (documentId, userId) => {
   return result.recordset[0];
 };
 
+const getDocumentMetaByIdForUser = async (documentId, userId) => {
+  await poolConnect;
+
+  const result = await pool
+    .request()
+    .input("documentId", sql.Int, parseInt(documentId, 10))
+    .input("userId", sql.Int, userId)
+    .query(`
+      SELECT TOP 1
+        id, user_id, title, category, description, filename, original_name,
+        mime_type, file_size, created_at
+      FROM documents
+      WHERE id = @documentId AND user_id = @userId
+    `);
+
+  return result.recordset[0];
+};
+
 const writeTempDocumentFile = (doc, buffer) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "authguard-preview-"));
   const safeOriginalName = path.basename(doc.original_name || doc.filename || "document");
@@ -145,6 +165,22 @@ const encryptUploadedFile = (file) => {
 };
 
 const getReadableDocument = (doc) => {
+  if (doc.file_data) {
+    const storedBuffer = Buffer.isBuffer(doc.file_data)
+      ? doc.file_data
+      : Buffer.from(doc.file_data);
+    const encrypted = isEncryptedFile(storedBuffer);
+    const buffer = decryptFile(storedBuffer);
+
+    if (!encrypted && buffer === storedBuffer) {
+      const { tempDir, tempPath } = writeTempDocumentFile(doc, storedBuffer);
+      return { filePath: tempPath, buffer: storedBuffer, tempDir };
+    }
+
+    const { tempDir, tempPath } = writeTempDocumentFile(doc, buffer);
+    return { filePath: tempPath, buffer, tempDir };
+  }
+
   const filePath = path.join(uploadsDir, doc.filename);
 
   if (!fs.existsSync(filePath)) {
@@ -173,7 +209,9 @@ router.get("/my", authMiddleware, async (req, res) => {
       .request()
       .input("userId", sql.Int, req.user.id)
       .query(`
-        SELECT *
+        SELECT
+          id, user_id, title, category, description, filename, original_name,
+          mime_type, file_size, created_at
         FROM documents
         WHERE user_id = @userId
         ORDER BY created_at DESC
@@ -207,7 +245,7 @@ router.post("/add", authMiddleware, upload.single("file"), (req, res, next) => {
 
     await poolConnect;
 
-    const result = await pool
+    const addRequest = pool
       .request()
       .input("userId", sql.Int, req.user.id)
       .input("title", sql.NVarChar(255), title.trim())
@@ -216,14 +254,21 @@ router.post("/add", authMiddleware, upload.single("file"), (req, res, next) => {
       .input("filename", sql.NVarChar(500), req.file.filename)
       .input("originalName", sql.NVarChar(500), req.file.originalname)
       .input("mimeType", sql.NVarChar(255), req.file.mimetype)
-      .input("fileSize", sql.Int, req.file.size)
-      .query(`
+      .input("fileSize", sql.Int, req.file.size);
+
+    if (storeFilesInDatabase) {
+      addRequest.input("fileData", sql.NVarChar(sql.MAX), fs.readFileSync(req.file.path));
+    }
+
+    const result = await addRequest.query(`
         INSERT INTO documents (
           user_id, title, category, description, filename, original_name, mime_type, file_size
+          ${storeFilesInDatabase ? ", file_data" : ""}
         )
         OUTPUT INSERTED.*
         VALUES (
           @userId, @title, @category, @description, @filename, @originalName, @mimeType, @fileSize
+          ${storeFilesInDatabase ? ", @fileData" : ""}
         )
       `);
 
@@ -231,7 +276,10 @@ router.post("/add", authMiddleware, upload.single("file"), (req, res, next) => {
 
     res.json({
       message: "Құжат сәтті жүктелді",
-      document: result.recordset[0],
+      document: {
+        ...result.recordset[0],
+        file_data: undefined,
+      },
     });
   } catch (error) {
     console.error("ADD DOCUMENT ERROR:", error);
@@ -243,7 +291,7 @@ router.post("/add", authMiddleware, upload.single("file"), (req, res, next) => {
 
 router.get("/view/:id", authMiddleware, async (req, res) => {
   try {
-    const doc = await getDocumentByIdForUser(req.params.id, req.user.id);
+    const doc = await getDocumentMetaByIdForUser(req.params.id, req.user.id);
 
     if (!doc) {
       return res.status(404).json({ message: "Құжат табылмады" });
