@@ -27,6 +27,61 @@ function generateSixDigitCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function getAdminEmails() {
+  return (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function getAdminCount() {
+  await poolConnect;
+
+  const result = await pool.request().query(`
+    SELECT COUNT(*) AS total
+    FROM users
+    WHERE role = 'admin'
+  `);
+
+  return Number(result.recordset[0]?.total || 0);
+}
+
+async function resolveAssignedRole(email, currentRole = "user") {
+  const normalizedEmail = email.trim().toLowerCase();
+  const adminEmails = getAdminEmails();
+
+  if (adminEmails.includes(normalizedEmail)) {
+    return "admin";
+  }
+
+  const adminCount = await getAdminCount();
+  if (adminCount === 0) {
+    return "admin";
+  }
+
+  return currentRole || "user";
+}
+
+async function sendMailWithFallback({ to, subject, html, code, successMessage }) {
+  try {
+    await sendMail(to, subject, html);
+
+    return {
+      ok: true,
+      message: successMessage,
+    };
+  } catch (error) {
+    console.error("MAIL DELIVERY FALLBACK:", error);
+
+    return {
+      ok: false,
+      message: `Email сервисі уақытша қолжетімсіз. Уақытша код: ${code}`,
+      fallbackCode: code,
+      fallbackReason: "mail_unavailable",
+    };
+  }
+}
+
 function signToken(user) {
   return jwt.sign(
     {
@@ -131,22 +186,26 @@ const sendCode = async (req, res) => {
         `);
     }
 
-    await sendMail(
-      normalizedEmail,
-      "AuthGuard Locker - Растау коды",
-      `
+    const delivery = await sendMailWithFallback({
+      to: normalizedEmail,
+      subject: "AuthGuard Locker - Растау коды",
+      code,
+      successMessage: "Код email-ге жіберілді",
+      html: `
         <div style="font-family: Arial, sans-serif; padding: 20px;">
           <h2>AuthGuard Locker</h2>
           <p>Сіздің растау кодыңыз:</p>
           <h1 style="letter-spacing: 4px; color: #2563eb;">${code}</h1>
           <p>Бұл код 10 минут ішінде жарамды.</p>
         </div>
-      `
-    );
+      `,
+    });
 
     return res.json({
-      message: "Код email-ге жіберілді",
+      message: delivery.message,
       email: normalizedEmail,
+      fallbackCode: delivery.fallbackCode,
+      delivery: delivery.ok ? "email" : "fallback",
     });
   } catch (error) {
     console.error("SEND CODE ERROR:", error);
@@ -252,12 +311,17 @@ const register = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 12);
 
+    const assignedRole = await resolveAssignedRole(
+      normalizedEmail,
+      user.role || "user"
+    );
+
     await pool
       .request()
       .input("email", sql.NVarChar(255), normalizedEmail)
       .input("fullName", sql.NVarChar(255), fullName)
       .input("passwordHash", sql.NVarChar(500), hashedPassword)
-      .input("role", sql.NVarChar(50), user.role || "user")
+      .input("role", sql.NVarChar(50), assignedRole)
       .query(`
         UPDATE users
         SET full_name = @fullName,
@@ -341,6 +405,25 @@ const login = async (req, res) => {
         tempToken,
         message: "2FA кодын енгізіңіз",
       });
+    }
+
+    const assignedRole = await resolveAssignedRole(
+      normalizedEmail,
+      user.role || "user"
+    );
+
+    if (assignedRole !== (user.role || "user")) {
+      await pool
+        .request()
+        .input("userId", sql.Int, user.id)
+        .input("role", sql.NVarChar(50), assignedRole)
+        .query(`
+          UPDATE users
+          SET role = @role
+          WHERE id = @userId
+        `);
+
+      user.role = assignedRole;
     }
 
     const token = signToken(user);
@@ -483,21 +566,25 @@ const forgotPassword = async (req, res) => {
         WHERE email = @email
       `);
 
-    await sendMail(
-      normalizedEmail,
-      "AuthGuard Locker - Құпия сөзді қалпына келтіру",
-      `
+    const delivery = await sendMailWithFallback({
+      to: normalizedEmail,
+      subject: "AuthGuard Locker - Құпия сөзді қалпына келтіру",
+      code,
+      successMessage: "Құпия сөзді қалпына келтіру коды email-ге жіберілді",
+      html: `
         <div style="font-family: Arial, sans-serif; padding: 20px;">
           <h2>Құпия сөзді қалпына келтіру</h2>
           <p>Сіздің қалпына келтіру кодыңыз:</p>
           <h1 style="letter-spacing: 4px; color: #2563eb;">${code}</h1>
           <p>Бұл код 10 минут ішінде жарамды.</p>
         </div>
-      `
-    );
+      `,
+    });
 
     return res.json({
-      message: "Құпия сөзді қалпына келтіру коды email-ге жіберілді",
+      message: delivery.message,
+      fallbackCode: delivery.fallbackCode,
+      delivery: delivery.ok ? "email" : "fallback",
     });
   } catch (error) {
     console.error("FORGOT PASSWORD ERROR:", error);
