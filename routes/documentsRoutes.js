@@ -280,11 +280,10 @@ router.get("/download/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ message: "Файл серверде табылмады" });
     }
 
-    await writeLog(req.user.id, "DOCUMENT_DOWNLOAD", `Құжат жүктелді: ${doc.title}`);
     return res.download(filePath, doc.original_name);
   } catch (error) {
     console.error("DOWNLOAD DOCUMENT ERROR:", error);
-    res.status(500).json({ message: "Құжатты жүктеу кезінде қате шықты" });
+    return res.status(500).json({ message: "Құжатты жүктеу кезінде қате шықты" });
   }
 });
 
