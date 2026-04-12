@@ -2,7 +2,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
 const nodemailer = require("nodemailer");
-const { sql } = require("../config/db");
+const { sql, pool, poolConnect } = require("../config/db");
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -15,10 +15,17 @@ const transporter = nodemailer.createTransport({
 async function logActivity(userId, actionType, actionDetails) {
   try {
     if (!userId) return;
-    await sql.query`
-      INSERT INTO activity_logs (user_id, action_type, action_details, created_at)
-      VALUES (${userId}, ${actionType}, ${actionDetails}, GETDATE())
-    `;
+
+    await poolConnect;
+    await pool
+      .request()
+      .input("userId", sql.Int, userId)
+      .input("actionType", sql.NVarChar(100), actionType)
+      .input("actionDetails", sql.NVarChar(sql.MAX), actionDetails)
+      .query(`
+        INSERT INTO activity_logs (user_id, action_type, action_details, created_at)
+        VALUES (@userId, @actionType, @actionDetails, GETDATE())
+      `);
   } catch (error) {
     console.error("LOG ACTIVITY ERROR:", error);
   }
@@ -59,15 +66,20 @@ const sendCode = async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const existing = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
 
-    if (
-      existing.recordset.length > 0 &&
-      existing.recordset[0].password_hash &&
-      existing.recordset[0].is_verified
-    ) {
+    const existing = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
+
+    const existingUser = existing.recordset[0];
+
+    if (existingUser && existingUser.password_hash && existingUser.is_verified) {
       return res.status(400).json({
         message: "Бұл email-пен аккаунт бұрыннан тіркелген",
       });
@@ -76,37 +88,51 @@ const sendCode = async (req, res) => {
     const code = generateSixDigitCode();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    if (existing.recordset.length === 0) {
-      await sql.query`
-        INSERT INTO users (
-          full_name,
-          email,
-          password_hash,
-          role,
-          is_verified,
-          verification_code,
-          code_expires_at,
-          created_at
-        )
-        VALUES (
-          ${null},
-          ${normalizedEmail},
-          ${""},
-          ${"user"},
-          ${0},
-          ${code},
-          ${expiresAt},
-          GETDATE()
-        )
-      `;
+    if (!existingUser) {
+      await pool
+        .request()
+        .input("fullName", sql.NVarChar(255), null)
+        .input("email", sql.NVarChar(255), normalizedEmail)
+        .input("passwordHash", sql.NVarChar(500), "")
+        .input("role", sql.NVarChar(50), "user")
+        .input("isVerified", sql.Bit, 0)
+        .input("verificationCode", sql.NVarChar(10), code)
+        .input("codeExpiresAt", sql.DateTime, expiresAt)
+        .query(`
+          INSERT INTO users (
+            full_name,
+            email,
+            password_hash,
+            role,
+            is_verified,
+            verification_code,
+            code_expires_at,
+            created_at
+          )
+          VALUES (
+            @fullName,
+            @email,
+            @passwordHash,
+            @role,
+            @isVerified,
+            @verificationCode,
+            @codeExpiresAt,
+            GETDATE()
+          )
+        `);
     } else {
-      await sql.query`
-        UPDATE users
-        SET verification_code = ${code},
-            code_expires_at = ${expiresAt},
-            is_verified = 0
-        WHERE email = ${normalizedEmail}
-      `;
+      await pool
+        .request()
+        .input("email", sql.NVarChar(255), normalizedEmail)
+        .input("verificationCode", sql.NVarChar(10), code)
+        .input("codeExpiresAt", sql.DateTime, expiresAt)
+        .query(`
+          UPDATE users
+          SET verification_code = @verificationCode,
+              code_expires_at = @codeExpiresAt,
+              is_verified = 0
+          WHERE email = @email
+        `);
     }
 
     await sendMail(
@@ -145,9 +171,16 @@ const verifyCode = async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = result.recordset[0];
 
@@ -190,9 +223,16 @@ const register = async (req, res) => {
     const normalizedEmail = email.trim().toLowerCase();
     const fullName = full_name.trim();
 
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = result.recordset[0];
 
@@ -216,20 +256,31 @@ const register = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    await sql.query`
-      UPDATE users
-      SET full_name = ${fullName},
-          password_hash = ${hashedPassword},
-          role = ${user.role || "user"},
-          is_verified = 1,
-          verification_code = NULL,
-          code_expires_at = NULL
-      WHERE email = ${normalizedEmail}
-    `;
+    await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .input("fullName", sql.NVarChar(255), fullName)
+      .input("passwordHash", sql.NVarChar(500), hashedPassword)
+      .input("role", sql.NVarChar(50), user.role || "user")
+      .query(`
+        UPDATE users
+        SET full_name = @fullName,
+            password_hash = @passwordHash,
+            role = @role,
+            is_verified = 1,
+            verification_code = NULL,
+            code_expires_at = NULL
+        WHERE email = @email
+      `);
 
-    const updatedResult = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    const updatedResult = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const savedUser = updatedResult.recordset[0];
 
@@ -257,9 +308,16 @@ const login = async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = result.recordset[0];
 
@@ -320,9 +378,16 @@ const verify2FA = async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = result.recordset[0];
 
@@ -378,9 +443,16 @@ const forgotPassword = async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = result.recordset[0];
 
@@ -391,12 +463,17 @@ const forgotPassword = async (req, res) => {
     const code = generateSixDigitCode();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    await sql.query`
-      UPDATE users
-      SET reset_code = ${code},
-          reset_code_expires = ${expiresAt}
-      WHERE email = ${normalizedEmail}
-    `;
+    await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .input("resetCode", sql.NVarChar(10), code)
+      .input("resetCodeExpires", sql.DateTime, expiresAt)
+      .query(`
+        UPDATE users
+        SET reset_code = @resetCode,
+            reset_code_expires = @resetCodeExpires
+        WHERE email = @email
+      `);
 
     await sendMail(
       normalizedEmail,
@@ -441,9 +518,16 @@ const resetPassword = async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const result = await sql.query`
-      SELECT * FROM users WHERE email = ${normalizedEmail}
-    `;
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
 
     const user = result.recordset[0];
 
@@ -455,10 +539,7 @@ const resetPassword = async (req, res) => {
       return res.status(400).json({ message: "Қалпына келтіру коды қате" });
     }
 
-    if (
-      !user.reset_code_expires ||
-      new Date(user.reset_code_expires) < new Date()
-    ) {
+    if (!user.reset_code_expires || new Date(user.reset_code_expires) < new Date()) {
       return res.status(400).json({
         message: "Қалпына келтіру кодының уақыты өтіп кеткен",
       });
@@ -466,13 +547,17 @@ const resetPassword = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(newPassword, 12);
 
-    await sql.query`
-      UPDATE users
-      SET password_hash = ${hashedPassword},
-          reset_code = NULL,
-          reset_code_expires = NULL
-      WHERE email = ${normalizedEmail}
-    `;
+    await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .input("passwordHash", sql.NVarChar(500), hashedPassword)
+      .query(`
+        UPDATE users
+        SET password_hash = @passwordHash,
+            reset_code = NULL,
+            reset_code_expires = NULL
+        WHERE email = @email
+      `);
 
     await logActivity(user.id, "PASSWORD_RESET", `Пароль жаңартылды: ${user.email}`);
 
