@@ -27,6 +27,10 @@ function generateSixDigitCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function getVisibleVerificationCode(code) {
+  return process.env.SHOW_VERIFICATION_CODE === "false" ? undefined : code;
+}
+
 function getAdminEmails() {
   return (process.env.ADMIN_EMAILS || "")
     .split(",")
@@ -63,20 +67,23 @@ async function resolveAssignedRole(email, currentRole = "user") {
 }
 
 async function sendMailWithFallback({ to, subject, html, code, successMessage }) {
+  const visibleCode = getVisibleVerificationCode(code);
+
   try {
     await sendMail(to, subject, html);
 
     return {
       ok: true,
       message: successMessage,
+      fallbackCode: visibleCode,
     };
   } catch (error) {
     console.error("MAIL DELIVERY FALLBACK:", error);
 
     return {
       ok: false,
-      message: `Email сервисі уақытша қолжетімсіз. Уақытша код: ${code}`,
-      fallbackCode: code,
+      message: "Email сервисі уақытша қолжетімсіз. Сайттағы кодты қолданыңыз.",
+      fallbackCode: visibleCode,
       fallbackReason: "mail_unavailable",
     };
   }
