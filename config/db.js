@@ -206,4 +206,7 @@ const createSqlServerAdapter = () => {
   };
 };
 
-module.exports = usePostgres ? createPostgresAdapter() : createSqlServerAdapter();
+module.exports = {
+  ...(usePostgres ? createPostgresAdapter() : createSqlServerAdapter()),
+  dbDriver: usePostgres ? "postgres" : "mssql",
+};

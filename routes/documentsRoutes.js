@@ -35,6 +35,26 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 },
 });
 
+const uploadMiddleware = (req, res, next) => {
+  upload.single("file")(req, res, (error) => {
+    if (!error) {
+      return next();
+    }
+
+    console.error("UPLOAD MIDDLEWARE ERROR:", error);
+
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        message: "Файл көлемі 15MB-тан аспауы керек.",
+      });
+    }
+
+    return res.status(400).json({
+      message: error.message || "Файлды қабылдау кезінде қате шықты.",
+    });
+  });
+};
+
 const authMiddleware = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -224,7 +244,7 @@ router.get("/my", authMiddleware, async (req, res) => {
   }
 });
 
-router.post("/add", authMiddleware, upload.single("file"), (req, res, next) => {
+router.post("/add", authMiddleware, uploadMiddleware, (req, res, next) => {
   if (req.file) {
     encryptUploadedFile(req.file);
   }

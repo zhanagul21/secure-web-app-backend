@@ -6,7 +6,7 @@ const helmet = require("helmet");
 const path = require("path");
 const fs = require("fs");
 
-const { connectDB } = require("./config/db");
+const { connectDB, dbDriver } = require("./config/db");
 const { verifyEmailTransporter } = require("./utils/sendEmail");
 
 const authRoutes = require("./routes/authRoutes");
@@ -56,7 +56,11 @@ app.get("/", (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    db: dbDriver,
+    documentStorage: dbDriver === "postgres" ? "database" : "filesystem",
+  });
 });
 
 app.use("/api/auth", authRoutes);
