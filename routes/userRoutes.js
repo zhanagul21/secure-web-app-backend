@@ -9,15 +9,27 @@ const bcrypt = require("bcryptjs");
 router.get("/profile", verifyToken, async (req, res) => {
   try {
     await poolConnect;
+    let result;
 
-    const result = await pool
-      .request()
-      .input("userId", sql.Int, req.user.id)
-      .query(`
-        SELECT TOP 1 id, full_name, email, role, created_at, twofa_enabled
-        FROM users
-        WHERE id = @userId
-      `);
+    try {
+      result = await pool
+        .request()
+        .input("userId", sql.Int, req.user.id)
+        .query(`
+          SELECT TOP 1 id, full_name, email, role, created_at, twofa_enabled, avatar_url
+          FROM users
+          WHERE id = @userId
+        `);
+    } catch {
+      result = await pool
+        .request()
+        .input("userId", sql.Int, req.user.id)
+        .query(`
+          SELECT TOP 1 id, full_name, email, role, created_at, twofa_enabled
+          FROM users
+          WHERE id = @userId
+        `);
+    }
 
     const user = result.recordset[0];
 
@@ -50,6 +62,59 @@ router.get("/all-users", verifyToken, async (req, res) => {
   } catch (error) {
     console.error("ALL USERS ERROR:", error);
     res.status(500).json({ message: "Сервер қатесі" });
+  }
+});
+
+router.put("/profile", verifyToken, async (req, res) => {
+  try {
+    const { full_name, avatar_url } = req.body;
+
+    if (!full_name?.trim()) {
+      return res.status(400).json({ message: "Аты-жөні міндетті" });
+    }
+
+    await poolConnect;
+
+    try {
+      await pool
+        .request()
+        .input("userId", sql.Int, req.user.id)
+        .input("fullName", sql.NVarChar(255), full_name.trim())
+        .input("avatarUrl", sql.NVarChar(sql.MAX), avatar_url || null)
+        .query(`
+          UPDATE users
+          SET full_name = @fullName,
+              avatar_url = @avatarUrl
+          WHERE id = @userId
+        `);
+    } catch {
+      await pool
+        .request()
+        .input("userId", sql.Int, req.user.id)
+        .input("fullName", sql.NVarChar(255), full_name.trim())
+        .query(`
+          UPDATE users
+          SET full_name = @fullName
+          WHERE id = @userId
+        `);
+    }
+
+    const result = await pool
+      .request()
+      .input("userId", sql.Int, req.user.id)
+      .query(`
+        SELECT TOP 1 id, full_name, email, role, created_at, twofa_enabled, avatar_url
+        FROM users
+        WHERE id = @userId
+      `);
+
+    res.json({
+      message: "Профиль жаңартылды",
+      user: result.recordset[0],
+    });
+  } catch (error) {
+    console.error("UPDATE PROFILE ERROR:", error);
+    res.status(500).json({ message: "Профильді жаңарту қатесі" });
   }
 });
 

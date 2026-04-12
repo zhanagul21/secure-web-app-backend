@@ -420,11 +420,32 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
       doc.mime_type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ) {
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-      );
-      return res.send(readable.buffer);
+      const result = await mammoth.convertToHtml({ path: readable.filePath });
+
+      return res.send(`
+        <html>
+          <head>
+            <meta charset="UTF-8" />
+            <title>${doc.original_name}</title>
+            <style>
+              body {
+                font-family: Arial, sans-serif;
+                padding: 24px;
+                line-height: 1.7;
+                max-width: 920px;
+                margin: 0 auto;
+                background: #fff;
+                color: #111827;
+              }
+              img { max-width: 100%; }
+              table { border-collapse: collapse; width: 100%; }
+              td, th { border: 1px solid #cbd5e1; padding: 8px; }
+              p { margin: 0 0 12px; }
+            </style>
+          </head>
+          <body>${result.value}</body>
+        </html>
+      `);
     }
 
     if (doc.mime_type === "application/msword") {
@@ -664,11 +685,32 @@ router.get("/shared/:token", async (req, res) => {
       doc.mime_type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ) {
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-      );
-      return res.send(readable.buffer);
+      const resultHtml = await mammoth.convertToHtml({ path: readable.filePath });
+
+      return res.send(`
+        <html>
+          <head>
+            <meta charset="UTF-8" />
+            <title>${doc.original_name}</title>
+            <style>
+              body {
+                font-family: Arial, sans-serif;
+                padding: 24px;
+                line-height: 1.7;
+                max-width: 920px;
+                margin: 0 auto;
+                background: #fff;
+                color: #111827;
+              }
+              img { max-width: 100%; }
+              table { border-collapse: collapse; width: 100%; }
+              td, th { border: 1px solid #cbd5e1; padding: 8px; }
+              p { margin: 0 0 12px; }
+            </style>
+          </head>
+          <body>${resultHtml.value}</body>
+        </html>
+      `);
     }
 
     if (doc.mime_type === "application/msword") {

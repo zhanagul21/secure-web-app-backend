@@ -91,6 +91,7 @@ const createPostgresAdapter = () => {
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         full_name VARCHAR(255),
+        avatar_url TEXT,
         email VARCHAR(255) UNIQUE NOT NULL,
         password_hash VARCHAR(500),
         password VARCHAR(500),
@@ -104,6 +105,11 @@ const createPostgresAdapter = () => {
         twofa_enabled BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
+    `);
+
+    await pgPool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS avatar_url TEXT
     `);
 
     await pgPool.query(`
@@ -191,6 +197,15 @@ const createSqlServerAdapter = () => {
   const pool = new mssql.ConnectionPool(config);
   const poolConnect = pool.connect();
 
+  const ensureSqlServerSchema = async () => {
+    await pool.request().query(`
+      IF COL_LENGTH('users', 'avatar_url') IS NULL
+      BEGIN
+        ALTER TABLE users ADD avatar_url NVARCHAR(MAX) NULL;
+      END
+    `);
+  };
+
   pool.on("error", (err) => {
     console.error("SQL Server pool error:", err);
   });
@@ -201,6 +216,7 @@ const createSqlServerAdapter = () => {
     poolConnect,
     connectDB: async () => {
       await poolConnect;
+      await ensureSqlServerSchema();
       console.log("SQL Server connected");
     },
   };
