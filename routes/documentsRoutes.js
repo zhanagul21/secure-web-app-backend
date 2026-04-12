@@ -17,6 +17,19 @@ const execFileAsync = promisify(execFile);
 const uploadsDir = path.resolve(process.env.UPLOADS_DIR || "./uploads");
 const storeFilesInDatabase =
   Boolean(process.env.DATABASE_URL) && process.env.DB_DRIVER !== "mssql";
+const configuredUploadSizeMb = Number.parseInt(
+  process.env.MAX_UPLOAD_SIZE_MB || "100",
+  10
+);
+const maxUploadSizeMb =
+  Number.isFinite(configuredUploadSizeMb) && configuredUploadSizeMb > 0
+    ? configuredUploadSizeMb
+    : 100;
+const maxUploadSizeBytes = maxUploadSizeMb * 1024 * 1024;
+const frontendOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
@@ -32,7 +45,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 15 * 1024 * 1024 },
+  limits: { fileSize: maxUploadSizeBytes },
 });
 
 const uploadMiddleware = (req, res, next) => {
@@ -45,7 +58,7 @@ const uploadMiddleware = (req, res, next) => {
 
     if (error.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({
-        message: "Файл көлемі 15MB-тан аспауы керек.",
+        message: `Файл көлемі ${maxUploadSizeMb}MB-тан аспауы керек.`,
       });
     }
 
@@ -176,11 +189,25 @@ const writeTempDocumentFile = (doc, buffer) => {
   return { tempDir, tempPath };
 };
 
-const encryptUploadedFile = (file) => {
-  const storedBuffer = fs.readFileSync(file.path);
+const resolveFrontendBaseUrl = (req) => {
+  const requestOrigin = req.get("origin");
+
+  if (requestOrigin && frontendOrigins.includes(requestOrigin)) {
+    return requestOrigin;
+  }
+
+  return (
+    frontendOrigins.find((origin) => origin.startsWith("https://")) ||
+    frontendOrigins[0] ||
+    "http://localhost:5173"
+  );
+};
+
+const encryptUploadedFile = async (file) => {
+  const storedBuffer = await fs.promises.readFile(file.path);
 
   if (!isEncryptedFile(storedBuffer)) {
-    fs.writeFileSync(file.path, encryptFile(storedBuffer));
+    await fs.promises.writeFile(file.path, encryptFile(storedBuffer));
   }
 };
 
@@ -244,11 +271,20 @@ router.get("/my", authMiddleware, async (req, res) => {
   }
 });
 
-router.post("/add", authMiddleware, uploadMiddleware, (req, res, next) => {
-  if (req.file) {
-    encryptUploadedFile(req.file);
+router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => {
+  if (!req.file) {
+    return next();
   }
-  next();
+
+  try {
+    await encryptUploadedFile(req.file);
+    return next();
+  } catch (error) {
+    console.error("ENCRYPT UPLOAD ERROR:", error);
+    return res.status(500).json({
+      message: "Файлды шифрлау кезінде қате шықты.",
+    });
+  }
 }, async (req, res) => {
   try {
     const { title, category, description } = req.body;
@@ -277,7 +313,11 @@ router.post("/add", authMiddleware, uploadMiddleware, (req, res, next) => {
       .input("fileSize", sql.Int, req.file.size);
 
     if (storeFilesInDatabase) {
-      addRequest.input("fileData", sql.NVarChar(sql.MAX), fs.readFileSync(req.file.path));
+      addRequest.input(
+        "fileData",
+        sql.NVarChar(sql.MAX),
+        await fs.promises.readFile(req.file.path)
+      );
     }
 
     const result = await addRequest.query(`
@@ -292,6 +332,10 @@ router.post("/add", authMiddleware, uploadMiddleware, (req, res, next) => {
         )
       `);
 
+    if (storeFilesInDatabase && fs.existsSync(req.file.path)) {
+      await fs.promises.unlink(req.file.path);
+    }
+
     await writeLog(req.user.id, "DOCUMENT_ADD", `Құжат қосылды: ${title.trim()}`);
 
     res.json({
@@ -303,6 +347,15 @@ router.post("/add", authMiddleware, uploadMiddleware, (req, res, next) => {
     });
   } catch (error) {
     console.error("ADD DOCUMENT ERROR:", error);
+
+    if (req.file?.path && storeFilesInDatabase && fs.existsSync(req.file.path)) {
+      try {
+        await fs.promises.unlink(req.file.path);
+      } catch (cleanupError) {
+        console.error("UPLOAD CLEANUP ERROR:", cleanupError);
+      }
+    }
+
     res.status(500).json({
       message: error.message || "Құжат жүктеу кезінде қате шықты",
     });
@@ -560,7 +613,7 @@ router.post("/share/:id", authMiddleware, async (req, res) => {
       `Сілтеме жасалды: ${doc.title}, ${durationMinutes} минут`
     );
 
-    const shareUrl = `${process.env.FRONTEND_URL}/shared/${token}`;
+    const shareUrl = `${resolveFrontendBaseUrl(req)}/shared/${token}`;
 
     res.json({
       message: "Сілтеме сәтті жасалды",
