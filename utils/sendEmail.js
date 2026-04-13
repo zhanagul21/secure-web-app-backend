@@ -6,10 +6,9 @@ const smtpHost = process.env.SMTP_HOST || "smtp.gmail.com";
 const smtpFamily = Number.parseInt(process.env.SMTP_FAMILY || "4", 10);
 const defaultFrom = process.env.MAIL_FROM || `"AuthGuard Locker" <${smtpUser}>`;
 
-const buildTransporter = ({ secure, port }) =>
+const buildTransporter = ({ secure, port, service }) =>
   nodemailer.createTransport({
-    host: smtpHost,
-    port,
+    ...(service ? { service } : { host: smtpHost, port }),
     secure,
     auth: {
       user: smtpUser,
@@ -38,6 +37,13 @@ const transporters = [
     transporter: buildTransporter({
       secure: true,
       port: Number.parseInt(process.env.SMTP_SSL_PORT || "465", 10),
+    }),
+  },
+  {
+    name: "gmail-service",
+    transporter: buildTransporter({
+      secure: true,
+      service: "gmail",
     }),
   },
 ];
