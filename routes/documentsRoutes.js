@@ -7,6 +7,7 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const mammoth = require("mammoth");
+const WordExtractor = require("word-extractor");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { sql, pool, poolConnect } = require("../config/db");
@@ -97,12 +98,41 @@ const getLibreOfficeExecutable = () => {
   return process.platform === "win32" ? "soffice.exe" : "soffice";
 };
 
+const getLibreOfficeCandidates = () => {
+  const candidates = [
+    getLibreOfficeExecutable(),
+    "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+    "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+    process.platform === "win32" ? "libreoffice.exe" : "libreoffice",
+    process.platform === "win32" ? "soffice.exe" : "soffice",
+  ];
+
+  return [...new Set(candidates.filter(Boolean))];
+};
+
+const execLibreOffice = async (args) => {
+  let lastError = null;
+
+  for (const executable of getLibreOfficeCandidates()) {
+    try {
+      return await execFileAsync(executable, args, { timeout: 30000 });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("LibreOffice табылмады");
+};
+
 const convertDocToDocx = async (inputPath) => {
-  const soffice = getLibreOfficeExecutable();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "authguard-doc-"));
 
-  await execFileAsync(soffice, [
+  await execLibreOffice([
     "--headless",
+    "--nologo",
+    "--nofirststartwizard",
+    "--nodefault",
+    "--nolockcheck",
     "--convert-to",
     "docx",
     "--outdir",
@@ -118,6 +148,44 @@ const convertDocToDocx = async (inputPath) => {
   }
 
   return { convertedPath, tempDir };
+};
+
+const convertDocumentToPdf = async (inputPath) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "authguard-doc-"));
+
+  await execLibreOffice([
+    "--headless",
+    "--nologo",
+    "--nofirststartwizard",
+    "--nodefault",
+    "--nolockcheck",
+    "--convert-to",
+    "pdf:writer_pdf_Export",
+    "--outdir",
+    tempDir,
+    inputPath,
+  ]);
+
+  const baseName = path.basename(inputPath, path.extname(inputPath));
+  const convertedPath = path.join(tempDir, `${baseName}.pdf`);
+
+  if (!fs.existsSync(convertedPath)) {
+    throw new Error("WORD файлын PDF-ке айналдыру мүмкін болмады");
+  }
+
+  return { convertedPath, tempDir };
+};
+
+const sendConvertedPdfPreview = async (res, inputPath, currentTempDir) => {
+  const { convertedPath, tempDir } = await convertDocumentToPdf(inputPath);
+  cleanupDir(currentTempDir);
+
+  const pdfBuffer = await fs.promises.readFile(convertedPath);
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", "inline");
+  res.send(pdfBuffer);
+
+  return tempDir;
 };
 
 const cleanupDir = (dirPath) => {
@@ -213,6 +281,93 @@ const encryptUploadedFile = async (file) => {
   if (!isEncryptedFile(storedBuffer)) {
     await fs.promises.writeFile(file.path, encryptFile(storedBuffer));
   }
+};
+
+const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
+  <html>
+    <head>
+      <meta charset="UTF-8" />
+      <title>${title}</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          padding: 24px;
+          line-height: ${compact ? "1.6" : "1.7"};
+          max-width: ${compact ? "900px" : "920px"};
+          margin: 0 auto;
+          background: #fff;
+          color: #111827;
+        }
+        img { max-width: 100%; }
+        table { border-collapse: collapse; width: 100%; }
+        td, th { border: 1px solid #cbd5e1; padding: 8px; }
+        p { margin: 0 0 12px; }
+        pre {
+          white-space: pre-wrap;
+          word-break: break-word;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 16px;
+          padding: 16px;
+        }
+        .word-fallback {
+          white-space: pre;
+          word-break: normal;
+          overflow: auto;
+          tab-size: 8;
+          font-family: "Courier New", monospace;
+          font-size: 13px;
+          line-height: 1.55;
+        }
+      </style>
+    </head>
+    <body>${bodyHtml}</body>
+  </html>
+`;
+
+const escapeHtml = (text) =>
+  String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const renderDocxBufferPreview = async (buffer, title, compact = false) => {
+  const htmlResult = await mammoth.convertToHtml({ buffer });
+  const cleanedHtml = (htmlResult.value || "").trim();
+
+  if (cleanedHtml) {
+    return wrapPreviewHtml(title, cleanedHtml, compact);
+  }
+
+  const textResult = await mammoth.extractRawText({ buffer });
+  const cleanedText = (textResult.value || "").trim();
+
+  if (cleanedText) {
+    return wrapPreviewHtml(title, `<pre>${escapeHtml(cleanedText)}</pre>`, compact);
+  }
+
+  throw new Error("WORD_PREVIEW_EMPTY");
+};
+
+const renderDocxPathPreview = async (docxPath, title, compact = false) => {
+  const fileBuffer = await fs.promises.readFile(docxPath);
+  return renderDocxBufferPreview(fileBuffer, title, compact);
+};
+
+const renderDocPathTextPreview = async (docPath, title, compact = false) => {
+  const extractor = new WordExtractor();
+  const document = await extractor.extract(docPath);
+  const cleanedText = (document.getBody() || "").trim();
+
+  if (!cleanedText) {
+    throw new Error("DOC_PREVIEW_EMPTY");
+  }
+
+  return wrapPreviewHtml(
+    title,
+    `<pre class="word-fallback">${escapeHtml(cleanedText)}</pre>`,
+    compact
+  );
 };
 
 const getReadableDocument = (doc) => {
@@ -428,69 +583,39 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
       doc.mime_type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ) {
-      const result = await mammoth.convertToHtml({ buffer: readable.buffer });
+      try {
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
+      } catch (error) {
+        console.error("DOCX PDF PREVIEW ERROR:", error);
+        const previewHtml = await renderDocxBufferPreview(
+          readable.buffer,
+          doc.original_name
+        );
 
-      return res.send(`
-        <html>
-          <head>
-            <meta charset="UTF-8" />
-            <title>${doc.original_name}</title>
-            <style>
-              body {
-                font-family: Arial, sans-serif;
-                padding: 24px;
-                line-height: 1.7;
-                max-width: 920px;
-                margin: 0 auto;
-                background: #fff;
-                color: #111827;
-              }
-              img { max-width: 100%; }
-              table { border-collapse: collapse; width: 100%; }
-              td, th { border: 1px solid #cbd5e1; padding: 8px; }
-              p { margin: 0 0 12px; }
-            </style>
-          </head>
-          <body>${result.value}</body>
-        </html>
-      `);
+        return res.send(previewHtml);
+      }
     }
 
     if (doc.mime_type === "application/msword") {
       try {
-        const { convertedPath, tempDir } = await convertDocToDocx(readable.filePath);
-        cleanupDir(tempDirToDelete);
-        tempDirToDelete = tempDir;
-
-        const result = await mammoth.convertToHtml({ path: convertedPath });
-
-        return res.send(`
-          <html>
-            <head>
-              <meta charset="UTF-8" />
-              <title>${doc.original_name}</title>
-              <style>
-                body {
-                  font-family: Arial, sans-serif;
-                  padding: 24px;
-                  line-height: 1.6;
-                  max-width: 900px;
-                  margin: 0 auto;
-                  background: #fff;
-                  color: #111;
-                }
-                img { max-width: 100%; }
-                table { border-collapse: collapse; width: 100%; }
-                td, th { border: 1px solid #ccc; padding: 8px; }
-              </style>
-            </head>
-            <body>${result.value}</body>
-          </html>
-        `);
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
       } catch (error) {
-        return res.status(400).json({
-          message: "DOC preview үшін LibreOffice керек. DOCX/PDF қолданған дұрыс.",
-        });
+        const previewHtml = await renderDocPathTextPreview(
+          readable.filePath,
+          doc.original_name
+        );
+
+        return res.send(previewHtml);
       }
     }
 
@@ -693,69 +818,41 @@ router.get("/shared/:token", async (req, res) => {
       doc.mime_type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ) {
-      const resultHtml = await mammoth.convertToHtml({ buffer: readable.buffer });
+      try {
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
+      } catch (error) {
+        console.error("SHARED DOCX PDF PREVIEW ERROR:", error);
+        const previewHtml = await renderDocxBufferPreview(
+          readable.buffer,
+          doc.original_name,
+          true
+        );
 
-      return res.send(`
-        <html>
-          <head>
-            <meta charset="UTF-8" />
-            <title>${doc.original_name}</title>
-            <style>
-              body {
-                font-family: Arial, sans-serif;
-                padding: 24px;
-                line-height: 1.7;
-                max-width: 920px;
-                margin: 0 auto;
-                background: #fff;
-                color: #111827;
-              }
-              img { max-width: 100%; }
-              table { border-collapse: collapse; width: 100%; }
-              td, th { border: 1px solid #cbd5e1; padding: 8px; }
-              p { margin: 0 0 12px; }
-            </style>
-          </head>
-          <body>${resultHtml.value}</body>
-        </html>
-      `);
+        return res.send(previewHtml);
+      }
     }
 
     if (doc.mime_type === "application/msword") {
       try {
-        const { convertedPath, tempDir } = await convertDocToDocx(readable.filePath);
-        cleanupDir(tempDirToDelete);
-        tempDirToDelete = tempDir;
-
-        const resultHtml = await mammoth.convertToHtml({ path: convertedPath });
-
-        return res.send(`
-          <html>
-            <head>
-              <meta charset="UTF-8" />
-              <title>${doc.original_name}</title>
-              <style>
-                body {
-                  font-family: Arial, sans-serif;
-                  padding: 24px;
-                  line-height: 1.6;
-                  max-width: 900px;
-                  margin: 0 auto;
-                  background: #fff;
-                  color: #111;
-                }
-                img { max-width: 100%; }
-                table { border-collapse: collapse; width: 100%; }
-                td, th { border: 1px solid #ccc; padding: 8px; }
-              </style>
-            </head>
-            <body>${resultHtml.value}</body>
-          </html>
-        `);
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
       } catch (error) {
-        return res.status(400).json({
-          message: "DOC preview үшін LibreOffice керек. DOCX/PDF қолданған дұрыс.",
-        });
+        const previewHtml = await renderDocPathTextPreview(
+          readable.filePath,
+          doc.original_name,
+          true
+        );
+
+        return res.send(previewHtml);
       }
     }
 
