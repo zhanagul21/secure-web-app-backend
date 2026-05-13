@@ -27,6 +27,9 @@ const maxUploadSizeMb =
     ? configuredUploadSizeMb
     : 100;
 const maxUploadSizeBytes = maxUploadSizeMb * 1024 * 1024;
+const renderPostgresStorageLimitGb = Number.parseFloat(
+  process.env.RENDER_POSTGRES_STORAGE_GB || "1"
+);
 const frontendOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
   .split(",")
   .map((origin) => origin.trim())
@@ -226,7 +229,7 @@ const getDocumentByIdForUser = async (documentId, userId) => {
     .query(`
       SELECT TOP 1 *
       FROM documents
-      WHERE id = @documentId AND user_id = @userId
+      WHERE id = @documentId AND user_id = @userId AND deleted_at IS NULL
     `);
 
   return result.recordset[0];
@@ -244,7 +247,23 @@ const getDocumentMetaByIdForUser = async (documentId, userId) => {
         id, user_id, title, category, description, filename, original_name,
         mime_type, file_size, created_at
       FROM documents
-      WHERE id = @documentId AND user_id = @userId
+      WHERE id = @documentId AND user_id = @userId AND deleted_at IS NULL
+    `);
+
+  return result.recordset[0];
+};
+
+const getDeletedDocumentByIdForUser = async (documentId, userId) => {
+  await poolConnect;
+
+  const result = await pool
+    .request()
+    .input("documentId", sql.Int, parseInt(documentId, 10))
+    .input("userId", sql.Int, userId)
+    .query(`
+      SELECT TOP 1 *
+      FROM documents
+      WHERE id = @documentId AND user_id = @userId AND deleted_at IS NOT NULL
     `);
 
   return result.recordset[0];
@@ -419,7 +438,7 @@ router.get("/my", authMiddleware, async (req, res) => {
           id, user_id, title, category, description, filename, original_name,
           mime_type, file_size, created_at
         FROM documents
-        WHERE user_id = @userId
+        WHERE user_id = @userId AND deleted_at IS NULL
         ORDER BY created_at DESC
       `);
 
@@ -522,6 +541,44 @@ router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => 
     res.status(500).json({
       message: error.message || "Құжат жүктеу кезінде қате шықты",
     });
+  }
+});
+
+router.get("/limits", authMiddleware, async (req, res) => {
+  res.json({
+    maxUploadSizeMb,
+    maxUploadSizeBytes,
+    storage: {
+      mode: storeFilesInDatabase ? "database" : "filesystem",
+      renderPostgresStorageLimitGb:
+        Number.isFinite(renderPostgresStorageLimitGb) &&
+        renderPostgresStorageLimitGb > 0
+          ? renderPostgresStorageLimitGb
+          : null,
+    },
+  });
+});
+
+router.get("/trash", authMiddleware, async (req, res) => {
+  try {
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("userId", sql.Int, req.user.id)
+      .query(`
+        SELECT
+          id, user_id, title, category, description, filename, original_name,
+          mime_type, file_size, created_at, deleted_at
+        FROM documents
+        WHERE user_id = @userId AND deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC
+      `);
+
+    res.json({ documents: result.recordset });
+  } catch (error) {
+    console.error("GET TRASH DOCUMENTS ERROR:", error);
+    res.status(500).json({ message: "Корзинаны жүктеу кезінде қате шықты" });
   }
 });
 
@@ -676,6 +733,78 @@ router.delete("/delete/:id", authMiddleware, async (req, res) => {
       return res.status(404).json({ message: "Құжат табылмады" });
     }
 
+    await poolConnect;
+
+    await pool
+      .request()
+      .input("documentId", sql.Int, parseInt(req.params.id, 10))
+      .query(`
+        DELETE FROM shared_links
+        WHERE document_id = @documentId
+      `);
+
+    await pool
+      .request()
+      .input("documentId", sql.Int, parseInt(req.params.id, 10))
+      .input("userId", sql.Int, req.user.id)
+      .query(`
+        UPDATE documents
+        SET deleted_at = GETDATE()
+        WHERE id = @documentId AND user_id = @userId AND deleted_at IS NULL
+      `);
+
+    await writeLog(
+      req.user.id,
+      "DOCUMENT_DELETE",
+      `Құжат өшірілді: ${doc.title}`
+    );
+
+    res.json({ message: "Құжат сәтті өшірілді" });
+  } catch (error) {
+    console.error("DELETE DOCUMENT ERROR:", error);
+    res.status(500).json({
+      message: error.message || "Құжатты өшіру кезінде қате шықты",
+    });
+  }
+});
+
+router.patch("/restore/:id", authMiddleware, async (req, res) => {
+  try {
+    const doc = await getDeletedDocumentByIdForUser(req.params.id, req.user.id);
+
+    if (!doc) {
+      return res.status(404).json({ message: "Корзинада құжат табылмады" });
+    }
+
+    await poolConnect;
+
+    await pool
+      .request()
+      .input("documentId", sql.Int, parseInt(req.params.id, 10))
+      .input("userId", sql.Int, req.user.id)
+      .query(`
+        UPDATE documents
+        SET deleted_at = NULL
+        WHERE id = @documentId AND user_id = @userId
+      `);
+
+    await writeLog(req.user.id, "DOCUMENT_RESTORE", `Құжат қалпына келтірілді: ${doc.title}`);
+
+    res.json({ message: "Құжат қалпына келтірілді" });
+  } catch (error) {
+    console.error("RESTORE DOCUMENT ERROR:", error);
+    res.status(500).json({ message: "Құжатты қалпына келтіру кезінде қате шықты" });
+  }
+});
+
+router.delete("/permanent/:id", authMiddleware, async (req, res) => {
+  try {
+    const doc = await getDeletedDocumentByIdForUser(req.params.id, req.user.id);
+
+    if (!doc) {
+      return res.status(404).json({ message: "Корзинада құжат табылмады" });
+    }
+
     const filePath = doc.filename ? path.join(uploadsDir, doc.filename) : null;
 
     await poolConnect;
@@ -701,18 +830,12 @@ router.delete("/delete/:id", authMiddleware, async (req, res) => {
       fs.unlinkSync(filePath);
     }
 
-    await writeLog(
-      req.user.id,
-      "DOCUMENT_DELETE",
-      `Құжат өшірілді: ${doc.title}`
-    );
+    await writeLog(req.user.id, "DOCUMENT_PERMANENT_DELETE", `Құжат біржола өшірілді: ${doc.title}`);
 
-    res.json({ message: "Құжат сәтті өшірілді" });
+    res.json({ message: "Құжат біржола өшірілді" });
   } catch (error) {
-    console.error("DELETE DOCUMENT ERROR:", error);
-    res.status(500).json({
-      message: error.message || "Құжатты өшіру кезінде қате шықты",
-    });
+    console.error("PERMANENT DELETE DOCUMENT ERROR:", error);
+    res.status(500).json({ message: "Құжатты біржола өшіру кезінде қате шықты" });
   }
 });
 
@@ -775,7 +898,7 @@ router.get("/shared/:token", async (req, res) => {
         SELECT TOP 1 d.*, s.expires_at
         FROM shared_links s
         INNER JOIN documents d ON d.id = s.document_id
-        WHERE s.token = @token
+        WHERE s.token = @token AND d.deleted_at IS NULL
         ORDER BY s.id DESC
       `);
 
@@ -878,7 +1001,7 @@ router.get("/shared/:token/download", async (req, res) => {
         SELECT TOP 1 d.*, s.expires_at
         FROM shared_links s
         INNER JOIN documents d ON d.id = s.document_id
-        WHERE s.token = @token
+        WHERE s.token = @token AND d.deleted_at IS NULL
         ORDER BY s.id DESC
       `);
 

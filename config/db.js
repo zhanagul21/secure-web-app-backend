@@ -125,6 +125,7 @@ const createPostgresAdapter = () => {
         mime_type VARCHAR(255),
         file_size INTEGER,
         file_data BYTEA,
+        deleted_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
@@ -132,6 +133,11 @@ const createPostgresAdapter = () => {
     await pgPool.query(`
       ALTER TABLE documents
       ADD COLUMN IF NOT EXISTS file_data BYTEA
+    `);
+
+    await pgPool.query(`
+      ALTER TABLE documents
+      ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
     `);
 
     await pgPool.query(`
@@ -320,6 +326,7 @@ const createSqlServerAdapter = () => {
           mime_type NVARCHAR(255) NULL,
           file_size INT NULL,
           file_data VARBINARY(MAX) NULL,
+          deleted_at DATETIME NULL,
           created_at DATETIME NOT NULL DEFAULT GETDATE()
         );
       END
@@ -364,6 +371,13 @@ const createSqlServerAdapter = () => {
       IF COL_LENGTH('documents', 'file_data') IS NULL
       BEGIN
         ALTER TABLE documents ADD file_data VARBINARY(MAX) NULL;
+      END
+    `);
+
+    await pool.request().query(`
+      IF COL_LENGTH('documents', 'deleted_at') IS NULL
+      BEGIN
+        ALTER TABLE documents ADD deleted_at DATETIME NULL;
       END
     `);
 

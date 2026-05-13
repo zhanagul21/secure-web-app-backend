@@ -18,10 +18,24 @@ try {
 }
 
 const RP_NAME = "AuthGuard Locker";
+const configuredFrontendOrigins = (process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 const getOrigin = (req) =>
-  process.env.FRONTEND_URL?.split(",")[0]?.trim() || `https://${req.hostname}`;
-const getRpId = (req) =>
-  process.env.RP_ID || req.hostname || "localhost";
+  req.get("origin") ||
+  configuredFrontendOrigins.find((origin) => origin.startsWith("https://")) ||
+  configuredFrontendOrigins[0] ||
+  `https://${req.hostname}`;
+const getRpId = (req) => {
+  if (process.env.RP_ID) return process.env.RP_ID;
+
+  try {
+    return new URL(getOrigin(req)).hostname;
+  } catch {
+    return req.hostname || "localhost";
+  }
+};
 
 // ─── Уақытша challenge сақтау (production-да Redis қолданыңыз) ───
 const challengeStore = new Map();
@@ -88,7 +102,7 @@ router.post("/register/options", verifyToken, async (req, res) => {
       .query("SELECT credential_id FROM biometric_credentials WHERE user_id = @userId");
 
     const excludeCredentials = existingResult.recordset.map((row) => ({
-      id: Buffer.from(row.credential_id, "base64url"),
+      id: row.credential_id,
       type: "public-key",
     }));
 
@@ -153,7 +167,7 @@ router.post("/register/verify", verifyToken, async (req, res) => {
     await pool
       .request()
       .input("userId", sql.Int, userId)
-      .input("credentialId", sql.NVarChar(500), Buffer.from(cred.id).toString("base64url"))
+      .input("credentialId", sql.NVarChar(500), cred.id)
       .input("publicKey", sql.NVarChar(sql.MAX), Buffer.from(cred.publicKey).toString("base64"))
       .input("signCount", sql.BigInt, cred.counter)
       .input("deviceName", sql.NVarChar(255), deviceName || "Менің құрылғым")
@@ -220,7 +234,7 @@ router.post("/login/options", async (req, res) => {
     }
 
     const allowCredentials = credsResult.recordset.map((row) => ({
-      id: Buffer.from(row.credential_id, "base64url"),
+      id: row.credential_id,
       type: "public-key",
     }));
 
@@ -283,7 +297,7 @@ router.post("/login/verify", async (req, res) => {
       expectedOrigin: getOrigin(req),
       expectedRPID: getRpId(req),
       credential: {
-        id: Buffer.from(storedCred.credential_id, "base64url"),
+        id: storedCred.credential_id,
         publicKey: Buffer.from(storedCred.public_key, "base64"),
         counter: Number(storedCred.sign_count),
       },
