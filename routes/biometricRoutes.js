@@ -117,7 +117,6 @@ router.post("/register/options", verifyToken, async (req, res) => {
       authenticatorSelection: {
         residentKey: "preferred",
         userVerification: "preferred",
-        authenticatorAttachment: "platform", // built-in биометрия (FaceID, TouchID, Windows Hello)
       },
     });
 
