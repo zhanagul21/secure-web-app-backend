@@ -115,7 +115,8 @@ router.post("/register/options", verifyToken, async (req, res) => {
       attestationType: "none",
       excludeCredentials,
       authenticatorSelection: {
-        residentKey: "preferred",
+        residentKey: "discouraged",
+        requireResidentKey: false,
         userVerification: "preferred",
       },
     });
