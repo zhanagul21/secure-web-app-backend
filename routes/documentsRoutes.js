@@ -8,6 +8,7 @@ const os = require("os");
 const crypto = require("crypto");
 const mammoth = require("mammoth");
 const WordExtractor = require("word-extractor");
+const XLSX = require("xlsx");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { sql, pool, poolConnect } = require("../config/db");
@@ -33,6 +34,8 @@ const renderPostgresStorageLimitGb = Number.parseFloat(
 );
 const DOCX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const XLSX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const allowedFileTypes = new Map([
   [".pdf", ["application/pdf"]],
   [".png", ["image/png"]],
@@ -40,6 +43,8 @@ const allowedFileTypes = new Map([
   [".jpeg", ["image/jpeg"]],
   [".doc", ["application/msword"]],
   [".docx", [DOCX_MIME_TYPE]],
+  [".xls", ["application/vnd.ms-excel", "application/octet-stream"]],
+  [".xlsx", [XLSX_MIME_TYPE]],
   [".ppt", ["application/vnd.ms-powerpoint"]],
   [".pptx", ["application/vnd.openxmlformats-officedocument.presentationml.presentation"]],
   [".txt", ["text/plain"]],
@@ -381,8 +386,10 @@ const validateUploadedFileSignature = async (file) => {
     (extension === ".png" && startsWith(0x89, 0x50, 0x4e, 0x47)) ||
     ((extension === ".jpg" || extension === ".jpeg") &&
       startsWith(0xff, 0xd8, 0xff)) ||
-    ((extension === ".docx" || extension === ".pptx") && zipBasedOffice) ||
+    ((extension === ".docx" || extension === ".xlsx" || extension === ".pptx") && zipBasedOffice) ||
     ((extension === ".doc" || extension === ".ppt") &&
+      (startsWith(0xd0, 0xcf, 0x11, 0xe0) || zipBasedOffice)) ||
+    (extension === ".xls" &&
       (startsWith(0xd0, 0xcf, 0x11, 0xe0) || zipBasedOffice)) ||
     (extension === ".txt" && looksLikeText);
 
@@ -438,6 +445,13 @@ const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
           white-space: pre-wrap;
         }
         p { margin: 0 0 12px; }
+        .sheet-preview {
+          margin-bottom: 28px;
+        }
+        .sheet-preview h2 {
+          font-size: 18px;
+          margin: 0 0 14px;
+        }
         pre {
           white-space: pre-wrap;
           word-break: break-word;
@@ -512,6 +526,40 @@ const escapeHtml = (text) =>
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+
+const isSpreadsheetDocument = (doc) => {
+  const extension = path.extname(doc.original_name || doc.filename || "").toLowerCase();
+  return (
+    doc.mime_type === "application/vnd.ms-excel" ||
+    doc.mime_type === XLSX_MIME_TYPE ||
+    extension === ".xls" ||
+    extension === ".xlsx"
+  );
+};
+
+const renderSpreadsheetPreview = (buffer, title, compact = false) => {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  const sheets = workbook.SheetNames.map((sheetName) => {
+    const worksheet = workbook.Sheets[sheetName];
+    const tableHtml = XLSX.utils.sheet_to_html(worksheet, {
+      id: "",
+      editable: false,
+    });
+
+    return `
+      <section class="sheet-preview">
+        <h2>${escapeHtml(sheetName)}</h2>
+        ${tableHtml}
+      </section>
+    `;
+  }).join("");
+
+  if (!sheets.trim()) {
+    throw new Error("SPREADSHEET_PREVIEW_EMPTY");
+  }
+
+  return wrapPreviewHtml(title, sheets, compact);
+};
 
 const renderDocxBufferPreview = async (buffer, title, compact = false) => {
   const htmlResult = await mammoth.convertToHtml({ buffer });
@@ -823,6 +871,12 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
     if (doc.mime_type === "text/plain") {
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       return res.send(readable.buffer);
+    }
+
+    if (isSpreadsheetDocument(doc)) {
+      const previewHtml = renderSpreadsheetPreview(readable.buffer, doc.title);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(previewHtml);
     }
 
     if (
@@ -1163,6 +1217,12 @@ router.get("/shared/:token", async (req, res) => {
     if (doc.mime_type === "text/plain") {
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       return res.send(readable.buffer);
+    }
+
+    if (isSpreadsheetDocument(doc)) {
+      const previewHtml = renderSpreadsheetPreview(readable.buffer, doc.title, true);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(previewHtml);
     }
 
     if (
