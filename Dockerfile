@@ -5,7 +5,13 @@ RUN apt-get update \
     fonts-dejavu \
     fonts-liberation \
     fonts-noto-core \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    fontconfig \
+    default-jre-headless \
     libreoffice \
+    libreoffice-core \
+    libreoffice-common \
     libreoffice-writer \
   && rm -rf /var/lib/apt/lists/*
 
@@ -17,6 +23,6 @@ RUN npm ci --omit=dev
 COPY . .
 
 ENV NODE_ENV=production
-ENV LIBREOFFICE_PATH=libreoffice
+ENV LIBREOFFICE_PATH=/usr/bin/libreoffice
 
 CMD ["npm", "start"]
