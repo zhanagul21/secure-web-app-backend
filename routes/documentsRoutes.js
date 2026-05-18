@@ -12,6 +12,7 @@ const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { sql, pool, poolConnect } = require("../config/db");
 const { encryptFile, decryptFile, isEncryptedFile } = require("../utils/encryption");
+const { isAccessTokenBlacklisted } = require("../utils/tokenStore");
 
 const execFileAsync = promisify(execFile);
 
@@ -19,17 +20,30 @@ const uploadsDir = path.resolve(process.env.UPLOADS_DIR || "./uploads");
 const storeFilesInDatabase =
   Boolean(process.env.DATABASE_URL) && process.env.DB_DRIVER !== "mssql";
 const configuredUploadSizeMb = Number.parseInt(
-  process.env.MAX_UPLOAD_SIZE_MB || "100",
+  process.env.MAX_UPLOAD_SIZE_MB || "500",
   10
 );
 const maxUploadSizeMb =
   Number.isFinite(configuredUploadSizeMb) && configuredUploadSizeMb > 0
     ? configuredUploadSizeMb
-    : 100;
+    : 500;
 const maxUploadSizeBytes = maxUploadSizeMb * 1024 * 1024;
 const renderPostgresStorageLimitGb = Number.parseFloat(
   process.env.RENDER_POSTGRES_STORAGE_GB || "1"
 );
+const DOCX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const allowedFileTypes = new Map([
+  [".pdf", ["application/pdf"]],
+  [".png", ["image/png"]],
+  [".jpg", ["image/jpeg"]],
+  [".jpeg", ["image/jpeg"]],
+  [".doc", ["application/msword"]],
+  [".docx", [DOCX_MIME_TYPE]],
+  [".ppt", ["application/vnd.ms-powerpoint"]],
+  [".pptx", ["application/vnd.openxmlformats-officedocument.presentationml.presentation"]],
+  [".txt", ["text/plain"]],
+]);
 const frontendOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
   .split(",")
   .map((origin) => origin.trim())
@@ -53,6 +67,23 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: { fileSize: maxUploadSizeBytes },
+  fileFilter: (req, file, cb) => {
+    const normalizedOriginalName = Buffer.from(file.originalname, "latin1").toString(
+      "utf8"
+    );
+    const extension = path.extname(normalizedOriginalName).toLowerCase();
+    const mimeTypes = allowedFileTypes.get(extension);
+
+    if (!mimeTypes) {
+      return cb(new Error("Бұл файл түріне рұқсат жоқ"));
+    }
+
+    if (file.mimetype && !mimeTypes.includes(file.mimetype)) {
+      return cb(new Error("Файл кеңейтімі мен MIME түрі сәйкес емес"));
+    }
+
+    return cb(null, true);
+  },
 });
 
 const uploadMiddleware = (req, res, next) => {
@@ -75,7 +106,7 @@ const uploadMiddleware = (req, res, next) => {
   });
 };
 
-const authMiddleware = (req, res, next) => {
+const authMiddleware = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
@@ -84,7 +115,14 @@ const authMiddleware = (req, res, next) => {
     }
 
     const token = authHeader.split(" ")[1];
+    if (await isAccessTokenBlacklisted(token)) {
+      return res.status(401).json({ message: "Сессия аяқталған. Қайта кіріңіз." });
+    }
+
     req.user = jwt.verify(token, process.env.JWT_SECRET);
+    if (req.user.type !== "access") {
+      return res.status(401).json({ message: "Жарамсыз токен түрі" });
+    }
     next();
   } catch (error) {
     return res.status(401).json({ message: "Жарамсыз токен" });
@@ -104,6 +142,8 @@ const getLibreOfficeExecutable = () => {
 const getLibreOfficeCandidates = () => {
   const candidates = [
     getLibreOfficeExecutable(),
+    "/usr/bin/libreoffice",
+    "/usr/bin/soffice",
     "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
     "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
     process.platform === "win32" ? "libreoffice.exe" : "libreoffice",
@@ -118,7 +158,10 @@ const execLibreOffice = async (args) => {
 
   for (const executable of getLibreOfficeCandidates()) {
     try {
-      return await execFileAsync(executable, args, { timeout: 30000 });
+      return await execFileAsync(executable, args, {
+        timeout: 90000,
+        env: { ...process.env, HOME: process.env.HOME || os.tmpdir() },
+      });
     } catch (error) {
       lastError = error;
     }
@@ -155,19 +198,25 @@ const convertDocToDocx = async (inputPath) => {
 
 const convertDocumentToPdf = async (inputPath) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "authguard-doc-"));
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "authguard-lo-"));
 
-  await execLibreOffice([
-    "--headless",
-    "--nologo",
-    "--nofirststartwizard",
-    "--nodefault",
-    "--nolockcheck",
-    "--convert-to",
-    "pdf:writer_pdf_Export",
-    "--outdir",
-    tempDir,
-    inputPath,
-  ]);
+  try {
+    await execLibreOffice([
+      "--headless",
+      "--nologo",
+      "--nofirststartwizard",
+      "--nodefault",
+      "--nolockcheck",
+      `-env:UserInstallation=file://${profileDir.replace(/\\/g, "/")}`,
+      "--convert-to",
+      "pdf:writer_pdf_Export",
+      "--outdir",
+      tempDir,
+      inputPath,
+    ]);
+  } finally {
+    cleanupDir(profileDir);
+  }
 
   const baseName = path.basename(inputPath, path.extname(inputPath));
   const convertedPath = path.join(tempDir, `${baseName}.pdf`);
@@ -189,6 +238,18 @@ const sendConvertedPdfPreview = async (res, inputPath, currentTempDir) => {
   res.send(pdfBuffer);
 
   return tempDir;
+};
+
+const sendDocxHtmlPreview = async (res, buffer, title, compact = false) => {
+  const html = await renderDocxBufferPreview(buffer, title, compact);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
+};
+
+const sendDocHtmlPreview = async (res, filePath, title, compact = false) => {
+  const html = await renderDocPathTextPreview(filePath, title, compact);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
 };
 
 const cleanupDir = (dirPath) => {
@@ -302,24 +363,80 @@ const encryptUploadedFile = async (file) => {
   }
 };
 
+const validateUploadedFileSignature = async (file) => {
+  const buffer = await fs.promises.readFile(file.path);
+  const normalizedOriginalName = Buffer.from(file.originalname, "latin1").toString(
+    "utf8"
+  );
+  const extension = path.extname(normalizedOriginalName).toLowerCase();
+
+  const startsWith = (...bytes) =>
+    bytes.every((byte, index) => buffer[index] === byte);
+  const textSample = buffer.subarray(0, Math.min(buffer.length, 512));
+  const looksLikeText = !textSample.includes(0);
+  const zipBasedOffice = startsWith(0x50, 0x4b, 0x03, 0x04);
+
+  const isValid =
+    (extension === ".pdf" && startsWith(0x25, 0x50, 0x44, 0x46)) ||
+    (extension === ".png" && startsWith(0x89, 0x50, 0x4e, 0x47)) ||
+    ((extension === ".jpg" || extension === ".jpeg") &&
+      startsWith(0xff, 0xd8, 0xff)) ||
+    ((extension === ".docx" || extension === ".pptx") && zipBasedOffice) ||
+    ((extension === ".doc" || extension === ".ppt") &&
+      (startsWith(0xd0, 0xcf, 0x11, 0xe0) || zipBasedOffice)) ||
+    (extension === ".txt" && looksLikeText);
+
+  if (!isValid) {
+    throw new Error("Файл мазмұны таңдалған түрге сәйкес емес");
+  }
+};
+
 const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
   <html>
     <head>
       <meta charset="UTF-8" />
       <title>${title}</title>
       <style>
+        * { box-sizing: border-box; }
+        html {
+          background: #eef4fb;
+        }
         body {
           font-family: Arial, sans-serif;
-          padding: 24px;
+          padding: ${compact ? "16px" : "24px"};
           line-height: ${compact ? "1.6" : "1.7"};
-          max-width: ${compact ? "900px" : "920px"};
           margin: 0 auto;
-          background: #fff;
+          background: #eef4fb;
           color: #111827;
+          overflow: auto;
         }
-        img { max-width: 100%; }
-        table { border-collapse: collapse; width: 100%; }
-        td, th { border: 1px solid #cbd5e1; padding: 8px; }
+        .document-page {
+          background: #fff;
+          border: 1px solid #dbe7f3;
+          border-radius: 18px;
+          box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+          margin: 0 auto;
+          max-width: 100%;
+          overflow: auto;
+          padding: ${compact ? "18px" : "28px"};
+        }
+        img { max-width: 100%; height: auto; }
+        .table-wrap {
+          max-width: 100%;
+          overflow: auto;
+        }
+        table {
+          border-collapse: collapse;
+          min-width: 100%;
+          table-layout: auto;
+          width: max-content;
+        }
+        td, th {
+          border: 1px solid #cbd5e1;
+          padding: 7px 9px;
+          vertical-align: top;
+          white-space: pre-wrap;
+        }
         p { margin: 0 0 12px; }
         pre {
           white-space: pre-wrap;
@@ -332,15 +449,61 @@ const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
         .word-fallback {
           white-space: pre;
           word-break: normal;
-          overflow: auto;
+          display: inline-block;
+          min-width: max-content;
+          max-width: none;
+          overflow: visible;
           tab-size: 8;
           font-family: "Courier New", monospace;
-          font-size: 13px;
-          line-height: 1.55;
+          font-size: ${compact ? "9px" : "10px"};
+          line-height: 1.35;
+          transform-origin: top left;
+        }
+        .word-fallback-wrap {
+          max-width: 100%;
+          overflow: auto;
+          padding-bottom: 8px;
+        }
+        @media print {
+          html, body {
+            background: #fff;
+          }
+          .document-page {
+            border: 0;
+            box-shadow: none;
+          }
         }
       </style>
     </head>
-    <body>${bodyHtml}</body>
+    <body>
+      <main class="document-page">${bodyHtml}</main>
+      <script>
+        document.querySelectorAll("table").forEach((table) => {
+          if (table.parentElement && table.parentElement.classList.contains("table-wrap")) return;
+          const wrapper = document.createElement("div");
+          wrapper.className = "table-wrap";
+          table.parentNode.insertBefore(wrapper, table);
+          wrapper.appendChild(table);
+        });
+
+        function fitWordFallback() {
+          document.querySelectorAll(".word-fallback").forEach((pre) => {
+            pre.style.transform = "";
+            pre.style.marginBottom = "";
+            const wrapper = pre.parentElement;
+            const availableWidth = wrapper ? wrapper.clientWidth : window.innerWidth;
+            const naturalWidth = pre.scrollWidth;
+            if (!availableWidth || !naturalWidth || naturalWidth <= availableWidth) return;
+            const scale = Math.max(0.45, Math.min(1, availableWidth / naturalWidth));
+            pre.style.transform = "scale(" + scale + ")";
+            pre.style.marginBottom = ((pre.scrollHeight * scale) - pre.scrollHeight) + "px";
+          });
+        }
+
+        window.addEventListener("load", fitWordFallback);
+        window.addEventListener("resize", fitWordFallback);
+      </script>
+    </body>
   </html>
 `;
 
@@ -362,7 +525,11 @@ const renderDocxBufferPreview = async (buffer, title, compact = false) => {
   const cleanedText = (textResult.value || "").trim();
 
   if (cleanedText) {
-    return wrapPreviewHtml(title, `<pre>${escapeHtml(cleanedText)}</pre>`, compact);
+    return wrapPreviewHtml(
+      title,
+      `<div class="word-fallback-wrap"><pre class="word-fallback">${escapeHtml(cleanedText)}</pre></div>`,
+      compact
+    );
   }
 
   throw new Error("WORD_PREVIEW_EMPTY");
@@ -384,16 +551,29 @@ const renderDocPathTextPreview = async (docPath, title, compact = false) => {
 
   return wrapPreviewHtml(
     title,
-    `<pre class="word-fallback">${escapeHtml(cleanedText)}</pre>`,
+    `<div class="word-fallback-wrap"><pre class="word-fallback">${escapeHtml(cleanedText)}</pre></div>`,
     compact
   );
 };
 
-const getReadableDocument = (doc) => {
+const getStoredDocumentBuffer = (doc) => {
   if (doc.file_data) {
-    const storedBuffer = Buffer.isBuffer(doc.file_data)
+    return Buffer.isBuffer(doc.file_data)
       ? doc.file_data
       : Buffer.from(doc.file_data);
+  }
+
+  const filePath = path.join(uploadsDir, doc.filename);
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  return fs.readFileSync(filePath);
+};
+
+const getReadableDocument = (doc) => {
+  if (doc.file_data) {
+    const storedBuffer = getStoredDocumentBuffer(doc);
     const encrypted = isEncryptedFile(storedBuffer);
     const buffer = decryptFile(storedBuffer);
 
@@ -412,7 +592,7 @@ const getReadableDocument = (doc) => {
     return null;
   }
 
-  const storedBuffer = fs.readFileSync(filePath);
+  const storedBuffer = getStoredDocumentBuffer(doc);
 
   const encrypted = isEncryptedFile(storedBuffer);
   const buffer = decryptFile(storedBuffer);
@@ -455,12 +635,21 @@ router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => 
   }
 
   try {
+    await validateUploadedFileSignature(req.file);
     await encryptUploadedFile(req.file);
     return next();
   } catch (error) {
     console.error("ENCRYPT UPLOAD ERROR:", error);
-    return res.status(500).json({
-      message: "Файлды шифрлау кезінде қате шықты.",
+    if (req.file?.path && fs.existsSync(req.file.path)) {
+      try {
+        await fs.promises.unlink(req.file.path);
+      } catch (cleanupError) {
+        console.error("INVALID UPLOAD CLEANUP ERROR:", cleanupError);
+      }
+    }
+
+    return res.status(400).json({
+      message: error.message || "Файлды қабылдау кезінде қате шықты.",
     });
   }
 }, async (req, res) => {
@@ -637,9 +826,14 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
     }
 
     if (
-      doc.mime_type ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      doc.mime_type === DOCX_MIME_TYPE
     ) {
+      if (req.query.raw === "1") {
+        res.setHeader("Content-Type", DOCX_MIME_TYPE);
+        res.setHeader("Content-Disposition", "inline");
+        return res.send(readable.buffer);
+      }
+
       try {
         tempDirToDelete = await sendConvertedPdfPreview(
           res,
@@ -649,12 +843,8 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
         return;
       } catch (error) {
         console.error("DOCX PDF PREVIEW ERROR:", error);
-        const previewHtml = await renderDocxBufferPreview(
-          readable.buffer,
-          doc.original_name
-        );
-
-        return res.send(previewHtml);
+        await sendDocxHtmlPreview(res, readable.buffer, doc.title);
+        return;
       }
     }
 
@@ -667,12 +857,9 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
         );
         return;
       } catch (error) {
-        const previewHtml = await renderDocPathTextPreview(
-          readable.filePath,
-          doc.original_name
-        );
-
-        return res.send(previewHtml);
+        console.error("DOC PDF PREVIEW ERROR:", error);
+        await sendDocHtmlPreview(res, readable.filePath, doc.title);
+        return;
       }
     }
 
@@ -686,6 +873,47 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
     });
   } finally {
     cleanupDir(tempDirToDelete);
+  }
+});
+
+router.get("/encryption-proof/:id", authMiddleware, async (req, res) => {
+  try {
+    const doc = await getDocumentByIdForUser(req.params.id, req.user.id);
+
+    if (!doc) {
+      return res.status(404).json({ message: "Құжат табылмады" });
+    }
+
+    const storedBuffer = getStoredDocumentBuffer(doc);
+    if (!storedBuffer) {
+      return res.status(404).json({ message: "Файл серверде табылмады" });
+    }
+
+    const encrypted = isEncryptedFile(storedBuffer);
+    const decryptedBuffer = decryptFile(storedBuffer);
+    const ciphertextHash = crypto
+      .createHash("sha256")
+      .update(storedBuffer)
+      .digest("hex");
+
+    res.json({
+      encrypted,
+      algorithm: "AES-256-GCM",
+      marker: encrypted ? "AGENC1:" : "жоқ",
+      storedHeaderHex: storedBuffer.subarray(0, 16).toString("hex"),
+      storedHeaderText: storedBuffer.subarray(0, 7).toString("utf8"),
+      storedSizeBytes: storedBuffer.length,
+      originalSizeBytes: decryptedBuffer.length,
+      ciphertextSha256: ciphertextHash,
+      authTagBytes: encrypted ? 16 : 0,
+      ivBytes: encrypted ? 16 : 0,
+      databaseStorage: Boolean(doc.file_data),
+      explanation:
+        "Серверде сақталған файл AES-256-GCM арқылы ciphertext ретінде тұр. Preview/download кезінде ғана backend decrypt жасайды.",
+    });
+  } catch (error) {
+    console.error("ENCRYPTION PROOF ERROR:", error);
+    res.status(500).json({ message: "Шифрлау дәлелін алу кезінде қате шықты" });
   }
 });
 
@@ -938,9 +1166,14 @@ router.get("/shared/:token", async (req, res) => {
     }
 
     if (
-      doc.mime_type ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      doc.mime_type === DOCX_MIME_TYPE
     ) {
+      if (req.query.raw === "1") {
+        res.setHeader("Content-Type", DOCX_MIME_TYPE);
+        res.setHeader("Content-Disposition", "inline");
+        return res.send(readable.buffer);
+      }
+
       try {
         tempDirToDelete = await sendConvertedPdfPreview(
           res,
@@ -950,13 +1183,8 @@ router.get("/shared/:token", async (req, res) => {
         return;
       } catch (error) {
         console.error("SHARED DOCX PDF PREVIEW ERROR:", error);
-        const previewHtml = await renderDocxBufferPreview(
-          readable.buffer,
-          doc.original_name,
-          true
-        );
-
-        return res.send(previewHtml);
+        await sendDocxHtmlPreview(res, readable.buffer, doc.title, true);
+        return;
       }
     }
 
@@ -969,13 +1197,9 @@ router.get("/shared/:token", async (req, res) => {
         );
         return;
       } catch (error) {
-        const previewHtml = await renderDocPathTextPreview(
-          readable.filePath,
-          doc.original_name,
-          true
-        );
-
-        return res.send(previewHtml);
+        console.error("SHARED DOC PDF PREVIEW ERROR:", error);
+        await sendDocHtmlPreview(res, readable.filePath, doc.title, true);
+        return;
       }
     }
 
