@@ -9,6 +9,7 @@ const crypto = require("crypto");
 const mammoth = require("mammoth");
 const WordExtractor = require("word-extractor");
 const XLSX = require("xlsx");
+const JSZip = require("jszip");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { sql, pool, poolConnect } = require("../config/db");
@@ -36,7 +37,9 @@ const DOCX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const XLSX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-const allowedFileTypes = new Map([
+const PPTX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const verifiableFileTypes = new Map([
   [".pdf", ["application/pdf"]],
   [".png", ["image/png"]],
   [".jpg", ["image/jpeg"]],
@@ -46,7 +49,7 @@ const allowedFileTypes = new Map([
   [".xls", ["application/vnd.ms-excel", "application/octet-stream"]],
   [".xlsx", [XLSX_MIME_TYPE]],
   [".ppt", ["application/vnd.ms-powerpoint"]],
-  [".pptx", ["application/vnd.openxmlformats-officedocument.presentationml.presentation"]],
+  [".pptx", [PPTX_MIME_TYPE]],
   [".txt", ["text/plain"]],
 ]);
 const frontendOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
@@ -72,28 +75,20 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: { fileSize: maxUploadSizeBytes },
-  fileFilter: (req, file, cb) => {
-    const normalizedOriginalName = Buffer.from(file.originalname, "latin1").toString(
-      "utf8"
-    );
-    const extension = path.extname(normalizedOriginalName).toLowerCase();
-    const mimeTypes = allowedFileTypes.get(extension);
-
-    if (!mimeTypes) {
-      return cb(new Error("Бұл файл түріне рұқсат жоқ"));
-    }
-
-    if (file.mimetype && !mimeTypes.includes(file.mimetype)) {
-      return cb(new Error("Файл кеңейтімі мен MIME түрі сәйкес емес"));
-    }
-
-    return cb(null, true);
-  },
+  fileFilter: (req, file, cb) => cb(null, true),
 });
 
 const uploadMiddleware = (req, res, next) => {
-  upload.single("file")(req, res, (error) => {
+  upload.fields([
+    { name: "file", maxCount: 1 },
+    { name: "files", maxCount: 50 },
+  ])(req, res, (error) => {
     if (!error) {
+      req.uploadedFiles = [
+        ...(req.files?.file || []),
+        ...(req.files?.files || []),
+      ];
+      req.file = req.uploadedFiles[0] || null;
       return next();
     }
 
@@ -164,7 +159,7 @@ const execLibreOffice = async (args) => {
   for (const executable of getLibreOfficeCandidates()) {
     try {
       return await execFileAsync(executable, args, {
-        timeout: 90000,
+        timeout: 240000,
         env: { ...process.env, HOME: process.env.HOME || os.tmpdir() },
       });
     } catch (error) {
@@ -214,7 +209,7 @@ const convertDocumentToPdf = async (inputPath) => {
       "--nolockcheck",
       `-env:UserInstallation=file://${profileDir.replace(/\\/g, "/")}`,
       "--convert-to",
-      "pdf:writer_pdf_Export",
+      "pdf",
       "--outdir",
       tempDir,
       inputPath,
@@ -232,6 +227,7 @@ const convertDocumentToPdf = async (inputPath) => {
 
   return { convertedPath, tempDir };
 };
+
 
 const sendConvertedPdfPreview = async (res, inputPath, currentTempDir) => {
   const { convertedPath, tempDir } = await convertDocumentToPdf(inputPath);
@@ -295,6 +291,32 @@ const getDocumentByIdForUser = async (documentId, userId) => {
     .query(`
       SELECT TOP 1 *
       FROM documents
+      WHERE id = @documentId
+        AND deleted_at IS NULL
+        AND (
+          user_id = @userId
+          OR EXISTS (
+            SELECT 1
+            FROM document_transfers dt
+            WHERE dt.document_id = documents.id
+              AND dt.recipient_id = @userId
+          )
+        )
+    `);
+
+  return result.recordset[0];
+};
+
+const getOwnedDocumentByIdForUser = async (documentId, userId) => {
+  await poolConnect;
+
+  const result = await pool
+    .request()
+    .input("documentId", sql.Int, parseInt(documentId, 10))
+    .input("userId", sql.Int, userId)
+    .query(`
+      SELECT TOP 1 *
+      FROM documents
       WHERE id = @documentId AND user_id = @userId AND deleted_at IS NULL
     `);
 
@@ -310,10 +332,20 @@ const getDocumentMetaByIdForUser = async (documentId, userId) => {
     .input("userId", sql.Int, userId)
     .query(`
       SELECT TOP 1
-        id, user_id, title, category, description, filename, original_name,
+        id, user_id, title, category, description, folder_name, filename, original_name,
         mime_type, file_size, created_at
       FROM documents
-      WHERE id = @documentId AND user_id = @userId AND deleted_at IS NULL
+      WHERE id = @documentId
+        AND deleted_at IS NULL
+        AND (
+          user_id = @userId
+          OR EXISTS (
+            SELECT 1
+            FROM document_transfers dt
+            WHERE dt.document_id = documents.id
+              AND dt.recipient_id = @userId
+          )
+        )
     `);
 
   return result.recordset[0];
@@ -375,6 +407,10 @@ const validateUploadedFileSignature = async (file) => {
   );
   const extension = path.extname(normalizedOriginalName).toLowerCase();
 
+  if (!verifiableFileTypes.has(extension)) {
+    return;
+  }
+
   const startsWith = (...bytes) =>
     bytes.every((byte, index) => buffer[index] === byte);
   const textSample = buffer.subarray(0, Math.min(buffer.length, 512));
@@ -402,7 +438,7 @@ const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
   <html>
     <head>
       <meta charset="UTF-8" />
-      <title>${title}</title>
+      <title>${escapeHtml(title || "Document preview")}</title>
       <style>
         * { box-sizing: border-box; }
         html {
@@ -448,9 +484,36 @@ const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
         .sheet-preview {
           margin-bottom: 28px;
         }
-        .sheet-preview h2 {
+        .sheet-preview h2,
+        .slide-preview h2 {
           font-size: 18px;
           margin: 0 0 14px;
+        }
+        .presentation-preview {
+          display: grid;
+          gap: 18px;
+        }
+        .slide-preview {
+          aspect-ratio: 16 / 9;
+          background: #fff;
+          border: 1px solid #cbd5e1;
+          border-radius: 14px;
+          box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.03);
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          min-height: 260px;
+          overflow: auto;
+          padding: ${compact ? "20px" : "32px"};
+        }
+        .slide-preview p {
+          font-size: ${compact ? "15px" : "18px"};
+          line-height: 1.5;
+          margin: 0 0 10px;
+        }
+        .slide-preview .muted {
+          color: #64748b;
+          font-size: 14px;
         }
         pre {
           white-space: pre-wrap;
@@ -477,6 +540,45 @@ const wrapPreviewHtml = (title, bodyHtml, compact = false) => `
           max-width: 100%;
           overflow: auto;
           padding-bottom: 8px;
+        }
+        .legacy-doc-preview {
+          color: #0f172a;
+          font-family: "Times New Roman", Times, serif;
+          min-width: max-content;
+        }
+        .legacy-doc-line {
+          font-size: ${compact ? "12px" : "14px"};
+          margin: 0 0 10px;
+          white-space: pre-wrap;
+        }
+        .legacy-doc-table-wrap {
+          margin: 12px 0 22px;
+          max-width: 100%;
+          overflow: auto;
+        }
+        .legacy-doc-table {
+          border-collapse: collapse;
+          color: #0f172a;
+          font-family: "Times New Roman", Times, serif;
+          font-size: ${compact ? "9px" : "10px"};
+          line-height: 1.25;
+          min-width: max-content;
+          table-layout: auto;
+          width: max-content;
+        }
+        .legacy-doc-table td {
+          border: 1px solid #1f2937;
+          min-width: 28px;
+          padding: 3px 5px;
+          text-align: center;
+          vertical-align: middle;
+          white-space: pre-wrap;
+        }
+        .legacy-doc-table td:first-child,
+        .legacy-doc-table td:nth-child(2),
+        .legacy-doc-table td:nth-child(3),
+        .legacy-doc-table td:nth-child(4) {
+          text-align: left;
         }
         @media print {
           html, body {
@@ -527,6 +629,24 @@ const escapeHtml = (text) =>
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
+const decodeXmlText = (text) =>
+  String(text)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+
+const normalizeOfficeText = (text) =>
+  decodeXmlText(text)
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isReadableOfficeText = (text) =>
+  Boolean(text) &&
+  !/<\/?[A-Za-z][^>]*>/.test(text) &&
+  !/^[A-Za-z]+:[A-Za-z]+(?:\s|$)/.test(text);
+
 const isSpreadsheetDocument = (doc) => {
   const extension = path.extname(doc.original_name || doc.filename || "").toLowerCase();
   return (
@@ -534,6 +654,16 @@ const isSpreadsheetDocument = (doc) => {
     doc.mime_type === XLSX_MIME_TYPE ||
     extension === ".xls" ||
     extension === ".xlsx"
+  );
+};
+
+const isPresentationDocument = (doc) => {
+  const extension = path.extname(doc.original_name || doc.filename || "").toLowerCase();
+  return (
+    doc.mime_type === "application/vnd.ms-powerpoint" ||
+    doc.mime_type === PPTX_MIME_TYPE ||
+    extension === ".ppt" ||
+    extension === ".pptx"
   );
 };
 
@@ -559,6 +689,47 @@ const renderSpreadsheetPreview = (buffer, title, compact = false) => {
   }
 
   return wrapPreviewHtml(title, sheets, compact);
+};
+
+const renderPresentationPreview = async (buffer, title, compact = false) => {
+  const zip = await JSZip.loadAsync(buffer);
+  const slideFiles = Object.keys(zip.files)
+    .filter((fileName) => /^ppt\/slides\/slide\d+\.xml$/i.test(fileName))
+    .sort((a, b) => {
+      const aNumber = Number(a.match(/slide(\d+)\.xml/i)?.[1] || 0);
+      const bNumber = Number(b.match(/slide(\d+)\.xml/i)?.[1] || 0);
+      return aNumber - bNumber;
+    });
+
+  if (!slideFiles.length) {
+    throw new Error("PRESENTATION_PREVIEW_EMPTY");
+  }
+
+  const slides = await Promise.all(
+    slideFiles.map(async (fileName, index) => {
+      const xml = await zip.file(fileName).async("string");
+      const textRuns = [...xml.matchAll(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g)]
+        .map((match) => normalizeOfficeText(match[1]))
+        .filter(isReadableOfficeText);
+
+      const body = textRuns.length
+        ? textRuns.map((text) => `<p>${escapeHtml(text)}</p>`).join("")
+        : `<p class="muted">Бұл слайдта мәтін табылмады.</p>`;
+
+      return `
+        <section class="slide-preview">
+          <h2>Slide ${index + 1}</h2>
+          <div>${body}</div>
+        </section>
+      `;
+    })
+  );
+
+  return wrapPreviewHtml(
+    title,
+    `<div class="presentation-preview">${slides.join("")}</div>`,
+    compact
+  );
 };
 
 const renderDocxBufferPreview = async (buffer, title, compact = false) => {
@@ -588,6 +759,140 @@ const renderDocxPathPreview = async (docxPath, title, compact = false) => {
   return renderDocxBufferPreview(fileBuffer, title, compact);
 };
 
+const trimTrailingEmptyCells = (cells) => {
+  const nextCells = [...cells];
+  while (nextCells.length && !nextCells[nextCells.length - 1].trim()) {
+    nextCells.pop();
+  }
+  return nextCells;
+};
+
+const LEGACY_DOC_MONTHS = new Set([
+  "январь",
+  "февраль",
+  "март",
+  "апрель",
+  "май",
+  "июнь",
+  "июль",
+  "август",
+  "сентябрь",
+  "октябрь",
+  "ноябрь",
+  "декабрь",
+  "қаңтар",
+  "ақпан",
+  "наурыз",
+  "сәуір",
+  "мамыр",
+  "маусым",
+  "шілде",
+  "тамыз",
+  "қыркүйек",
+  "қазан",
+  "қараша",
+  "желтоқсан",
+]);
+
+const isLegacyDocMonth = (value) =>
+  LEGACY_DOC_MONTHS.has(String(value || "").trim().toLowerCase());
+
+const splitLegacyDocCellsIntoRows = (cells) => {
+  const rowStarts = [];
+
+  for (let index = 0; index < cells.length - 1; index += 1) {
+    const current = String(cells[index] || "").trim();
+    const next = String(cells[index + 1] || "").trim();
+
+    if (current && isLegacyDocMonth(next)) {
+      rowStarts.push(index);
+    }
+  }
+
+  if (!rowStarts.length) {
+    return [cells];
+  }
+
+  const rows = [];
+  const headerCells = trimTrailingEmptyCells(cells.slice(0, rowStarts[0]));
+
+  if (headerCells.some((cell) => cell.trim())) {
+    rows.push(headerCells);
+  }
+
+  rowStarts.forEach((start, index) => {
+    const end = rowStarts[index + 1] || cells.length;
+    const row = trimTrailingEmptyCells(cells.slice(start, end));
+
+    if (row.some((cell) => cell.trim())) {
+      rows.push(row);
+    }
+  });
+
+  return rows;
+};
+
+const renderLegacyDocTable = (rows) => {
+  const body = rows
+    .map((row) => {
+      const cells = trimTrailingEmptyCells(row);
+      const htmlCells = cells
+        .map((cell) => `<td>${cell.trim() ? escapeHtml(cell.trim()) : "&nbsp;"}</td>`)
+        .join("");
+      return `<tr>${htmlCells}</tr>`;
+    })
+    .join("");
+
+  return `
+    <div class="legacy-doc-table-wrap">
+      <table class="legacy-doc-table">
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+};
+
+const renderLegacyDocText = (text) => {
+  const lines = String(text)
+    .replace(/\u00a0/g, " ")
+    .replace(/\r/g, "")
+    .split("\n");
+
+  const blocks = [];
+  let tableRows = [];
+
+  const flushTable = () => {
+    if (!tableRows.length) return;
+    blocks.push(renderLegacyDocTable(tableRows));
+    tableRows = [];
+  };
+
+  for (const line of lines) {
+    const cleanLine = line.replace(/[ \t]+$/g, "");
+    const trimmed = cleanLine.trim();
+
+    if (!trimmed) {
+      flushTable();
+      continue;
+    }
+
+    const cells = cleanLine.split("\t");
+    const meaningfulCells = cells.filter((cell) => cell.trim());
+
+    if (cells.length > 1 && meaningfulCells.length > 0) {
+      tableRows.push(...splitLegacyDocCellsIntoRows(cells));
+      continue;
+    }
+
+    flushTable();
+    blocks.push(`<p class="legacy-doc-line">${escapeHtml(trimmed)}</p>`);
+  }
+
+  flushTable();
+
+  return `<div class="legacy-doc-preview">${blocks.join("")}</div>`;
+};
+
 const renderDocPathTextPreview = async (docPath, title, compact = false) => {
   const extractor = new WordExtractor();
   const document = await extractor.extract(docPath);
@@ -599,7 +904,7 @@ const renderDocPathTextPreview = async (docPath, title, compact = false) => {
 
   return wrapPreviewHtml(
     title,
-    `<div class="word-fallback-wrap"><pre class="word-fallback">${escapeHtml(cleanedText)}</pre></div>`,
+    renderLegacyDocText(cleanedText),
     compact
   );
 };
@@ -663,7 +968,7 @@ router.get("/my", authMiddleware, async (req, res) => {
       .input("userId", sql.Int, req.user.id)
       .query(`
         SELECT
-          id, user_id, title, category, description, filename, original_name,
+          id, user_id, title, category, description, folder_name, filename, original_name,
           mime_type, file_size, created_at
         FROM documents
         WHERE user_id = @userId AND deleted_at IS NULL
@@ -678,21 +983,26 @@ router.get("/my", authMiddleware, async (req, res) => {
 });
 
 router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => {
-  if (!req.file) {
+  const files = req.uploadedFiles || [];
+  if (!files.length) {
     return next();
   }
 
   try {
-    await validateUploadedFileSignature(req.file);
-    await encryptUploadedFile(req.file);
+    for (const file of files) {
+      await validateUploadedFileSignature(file);
+      await encryptUploadedFile(file);
+    }
     return next();
   } catch (error) {
     console.error("ENCRYPT UPLOAD ERROR:", error);
-    if (req.file?.path && fs.existsSync(req.file.path)) {
-      try {
-        await fs.promises.unlink(req.file.path);
-      } catch (cleanupError) {
-        console.error("INVALID UPLOAD CLEANUP ERROR:", cleanupError);
+    for (const file of files) {
+      if (file?.path && fs.existsSync(file.path)) {
+        try {
+          await fs.promises.unlink(file.path);
+        } catch (cleanupError) {
+          console.error("INVALID UPLOAD CLEANUP ERROR:", cleanupError);
+        }
       }
     }
 
@@ -701,8 +1011,10 @@ router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => 
     });
   }
 }, async (req, res) => {
+  const files = req.uploadedFiles || [];
+
   try {
-    const { title, category, description } = req.body;
+    const { title, category, description, folderName } = req.body;
 
     if (!title?.trim() || !category?.trim()) {
       return res
@@ -710,68 +1022,90 @@ router.post("/add", authMiddleware, uploadMiddleware, async (req, res, next) => 
         .json({ message: "Құжат атауы мен категория міндетті" });
     }
 
-    if (!req.file) {
+    if (!files.length) {
       return res.status(400).json({ message: "Файл таңдалмаған" });
     }
 
     await poolConnect;
 
-    const normalizedOriginalName = Buffer.from(req.file.originalname, "latin1").toString(
-      "utf8"
-    );
+    const savedDocuments = [];
+    const cleanTitle = title.trim();
+    const cleanFolderName = folderName?.trim() || (files.length > 1 ? cleanTitle : "");
 
-    const addRequest = pool
-      .request()
-      .input("userId", sql.Int, req.user.id)
-      .input("title", sql.NVarChar(255), title.trim())
-      .input("category", sql.NVarChar(255), category.trim())
-      .input("description", sql.NVarChar(sql.MAX), description || "")
-      .input("filename", sql.NVarChar(500), req.file.filename)
-      .input("originalName", sql.NVarChar(500), normalizedOriginalName)
-      .input("mimeType", sql.NVarChar(255), req.file.mimetype)
-      .input("fileSize", sql.Int, req.file.size);
-
-    if (storeFilesInDatabase) {
-      addRequest.input(
-        "fileData",
-        sql.NVarChar(sql.MAX),
-        await fs.promises.readFile(req.file.path)
+    for (const file of files) {
+      const normalizedOriginalName = Buffer.from(file.originalname, "latin1").toString(
+        "utf8"
       );
-    }
+      const fileTitle =
+        files.length === 1
+          ? cleanTitle
+          : `${cleanTitle} - ${normalizedOriginalName.replace(/\.[^/.]+$/, "")}`;
 
-    const result = await addRequest.query(`
+      const addRequest = pool
+        .request()
+        .input("userId", sql.Int, req.user.id)
+        .input("title", sql.NVarChar(255), fileTitle.slice(0, 255))
+        .input("category", sql.NVarChar(255), category.trim())
+        .input("description", sql.NVarChar(sql.MAX), description || "")
+        .input("folderName", sql.NVarChar(255), cleanFolderName)
+        .input("filename", sql.NVarChar(500), file.filename)
+        .input("originalName", sql.NVarChar(500), normalizedOriginalName)
+        .input("mimeType", sql.NVarChar(255), file.mimetype)
+        .input("fileSize", sql.Int, file.size);
+
+      if (storeFilesInDatabase) {
+        addRequest.input(
+          "fileData",
+          sql.VarBinary ? sql.VarBinary(sql.MAX) : sql.NVarChar(sql.MAX),
+          await fs.promises.readFile(file.path)
+        );
+      }
+
+      const result = await addRequest.query(`
         INSERT INTO documents (
-          user_id, title, category, description, filename, original_name, mime_type, file_size
+          user_id, title, category, description, folder_name, filename, original_name, mime_type, file_size
           ${storeFilesInDatabase ? ", file_data" : ""}
         )
         OUTPUT INSERTED.*
         VALUES (
-          @userId, @title, @category, @description, @filename, @originalName, @mimeType, @fileSize
+          @userId, @title, @category, @description, @folderName, @filename, @originalName, @mimeType, @fileSize
           ${storeFilesInDatabase ? ", @fileData" : ""}
         )
       `);
 
-    if (storeFilesInDatabase && fs.existsSync(req.file.path)) {
-      await fs.promises.unlink(req.file.path);
-    }
+      if (storeFilesInDatabase && fs.existsSync(file.path)) {
+        await fs.promises.unlink(file.path);
+      }
 
-    await writeLog(req.user.id, "DOCUMENT_ADD", `Құжат қосылды: ${title.trim()}`);
-
-    res.json({
-      message: "Құжат сәтті жүктелді",
-      document: {
+      savedDocuments.push({
         ...result.recordset[0],
         file_data: undefined,
-      },
+      });
+    }
+
+    await writeLog(
+      req.user.id,
+      "DOCUMENT_ADD",
+      files.length > 1
+        ? `Бір топқа ${files.length} файл қосылды: ${cleanFolderName}`
+        : `Құжат қосылды: ${cleanTitle}`
+    );
+
+    res.json({
+      message: files.length > 1 ? `${files.length} файл сақталды` : "Файл сақталды",
+      document: savedDocuments[0],
+      documents: savedDocuments,
     });
   } catch (error) {
     console.error("ADD DOCUMENT ERROR:", error);
 
-    if (req.file?.path && storeFilesInDatabase && fs.existsSync(req.file.path)) {
-      try {
-        await fs.promises.unlink(req.file.path);
-      } catch (cleanupError) {
-        console.error("UPLOAD CLEANUP ERROR:", cleanupError);
+    for (const file of files) {
+      if (file?.path && storeFilesInDatabase && fs.existsSync(file.path)) {
+        try {
+          await fs.promises.unlink(file.path);
+        } catch (cleanupError) {
+          console.error("UPLOAD CLEANUP ERROR:", cleanupError);
+        }
       }
     }
 
@@ -805,7 +1139,7 @@ router.get("/trash", authMiddleware, async (req, res) => {
       .input("userId", sql.Int, req.user.id)
       .query(`
         SELECT
-          id, user_id, title, category, description, filename, original_name,
+          id, user_id, title, category, description, folder_name, filename, original_name,
           mime_type, file_size, created_at, deleted_at
         FROM documents
         WHERE user_id = @userId AND deleted_at IS NOT NULL
@@ -874,9 +1208,35 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
     }
 
     if (isSpreadsheetDocument(doc)) {
-      const previewHtml = renderSpreadsheetPreview(readable.buffer, doc.title);
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      return res.send(previewHtml);
+      try {
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
+      } catch (error) {
+        console.error("SPREADSHEET PDF PREVIEW ERROR:", error);
+        const previewHtml = renderSpreadsheetPreview(readable.buffer, doc.title);
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        return res.send(previewHtml);
+      }
+    }
+
+    if (isPresentationDocument(doc)) {
+      try {
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
+      } catch (error) {
+        console.error("PRESENTATION PDF PREVIEW ERROR:", error);
+        return res.status(502).json({
+          message: "PowerPoint preview PDF-ке айналмады. LibreOffice серверде іске қосылуы керек.",
+        });
+      }
     }
 
     if (
@@ -910,10 +1270,49 @@ router.get("/preview/:id", authMiddleware, async (req, res) => {
           tempDirToDelete
         );
         return;
-      } catch (error) {
-        console.error("DOC PDF PREVIEW ERROR:", error);
-        await sendDocHtmlPreview(res, readable.filePath, doc.title);
-        return;
+      } catch (pdfError) {
+        console.error("DOC PDF PREVIEW ERROR:", pdfError);
+
+        try {
+          await sendDocHtmlPreview(res, readable.filePath, doc.title);
+          return;
+        } catch (textPreviewError) {
+          console.error("DOC TEXT PREVIEW BEFORE DOCX ERROR:", textPreviewError);
+        }
+
+        let docxTempDir = null;
+        try {
+          const { convertedPath, tempDir: dt } = await convertDocToDocx(readable.filePath);
+          docxTempDir = dt;
+          try {
+            tempDirToDelete = await sendConvertedPdfPreview(
+              res,
+              convertedPath,
+              tempDirToDelete
+            );
+            return;
+          } catch (docxPdfError) {
+            console.error("DOCX PDF PREVIEW AFTER DOC CONVERT ERROR:", docxPdfError);
+          }
+
+          const docxBuffer = await fs.promises.readFile(convertedPath);
+          const html = await renderDocxBufferPreview(docxBuffer, doc.title);
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.send(html);
+          return;
+        } catch (docxError) {
+          console.error("DOC->DOCX CONVERT ERROR:", docxError);
+
+          try {
+            await sendDocHtmlPreview(res, readable.filePath, doc.title);
+            return;
+          } catch (textError) {
+            console.error("DOC TEXT PREVIEW ERROR:", textError);
+            return res.status(502).json({ message: "Word .doc preview could not be generated." });
+          }
+        } finally {
+          cleanupDir(docxTempDir);
+        }
       }
     }
 
@@ -1009,7 +1408,7 @@ router.get("/download/:id", authMiddleware, async (req, res) => {
 
 router.delete("/delete/:id", authMiddleware, async (req, res) => {
   try {
-    const doc = await getDocumentByIdForUser(req.params.id, req.user.id);
+    const doc = await getOwnedDocumentByIdForUser(req.params.id, req.user.id);
 
     if (!doc) {
       return res.status(404).json({ message: "Құжат табылмады" });
@@ -1121,9 +1520,100 @@ router.delete("/permanent/:id", authMiddleware, async (req, res) => {
   }
 });
 
+router.post("/send/:id", authMiddleware, async (req, res) => {
+  try {
+    const doc = await getOwnedDocumentByIdForUser(req.params.id, req.user.id);
+
+    if (!doc) {
+      return res.status(404).json({ message: "Құжат табылмады" });
+    }
+
+    const recipientEmail = String(req.body.recipientEmail || "").trim().toLowerCase();
+    const note = String(req.body.note || "").trim();
+
+    if (!recipientEmail) {
+      return res.status(400).json({ message: "Алушының email-ін жазыңыз" });
+    }
+
+    await poolConnect;
+
+    const recipientResult = await pool
+      .request()
+      .input("email", sql.NVarChar(255), recipientEmail)
+      .query(`
+        SELECT TOP 1 id, email, full_name
+        FROM users
+        WHERE LOWER(email) = LOWER(@email)
+      `);
+
+    const recipient = recipientResult.recordset[0];
+
+    if (!recipient) {
+      return res.status(404).json({ message: "Бұл email-мен тіркелген қолданушы табылмады" });
+    }
+
+    if (recipient.id === req.user.id) {
+      return res.status(400).json({ message: "Құжатты өзіңізге жіберудің қажеті жоқ" });
+    }
+
+    try {
+      await pool
+        .request()
+        .input("documentId", sql.Int, doc.id)
+        .input("senderId", sql.Int, req.user.id)
+        .input("recipientId", sql.Int, recipient.id)
+        .input("note", sql.NVarChar(sql.MAX), note)
+        .query(`
+          INSERT INTO document_transfers (document_id, sender_id, recipient_id, note, created_at)
+          VALUES (@documentId, @senderId, @recipientId, @note, GETDATE())
+        `);
+    } catch (error) {
+      const duplicateMessage = String(error.message || "").toLowerCase();
+      if (!duplicateMessage.includes("unique") && !duplicateMessage.includes("duplicate")) {
+        throw error;
+      }
+    }
+
+    await writeLog(req.user.id, "DOCUMENT_SEND", `Құжат жіберілді: ${doc.title}; Кімге: ${recipient.email}`);
+    await writeLog(recipient.id, "DOCUMENT_RECEIVE", `Сізге құжат жіберілді: ${doc.title}`);
+
+    res.json({ message: `${recipient.email} қолданушысына жіберілді` });
+  } catch (error) {
+    console.error("SEND DOCUMENT ERROR:", error);
+    res.status(500).json({ message: error.message || "Құжат жіберу кезінде қате шықты" });
+  }
+});
+
+router.get("/received", authMiddleware, async (req, res) => {
+  try {
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("userId", sql.Int, req.user.id)
+      .query(`
+        SELECT
+          d.id, d.user_id, d.title, d.category, d.description, d.folder_name,
+          d.filename, d.original_name, d.mime_type, d.file_size, d.created_at,
+          dt.created_at AS sent_at, dt.note,
+          u.email AS sender_email, u.full_name AS sender_name
+        FROM document_transfers dt
+        JOIN documents d ON d.id = dt.document_id
+        JOIN users u ON u.id = dt.sender_id
+        WHERE dt.recipient_id = @userId AND d.deleted_at IS NULL
+        ORDER BY dt.created_at DESC
+      `);
+
+    res.json({ documents: result.recordset });
+  } catch (error) {
+    console.error("RECEIVED DOCUMENTS ERROR:", error);
+    res.status(500).json({ message: "Жіберілген құжаттарды жүктеу кезінде қате шықты" });
+  }
+});
+
 router.post("/share/:id", authMiddleware, async (req, res) => {
   try {
-    const doc = await getDocumentByIdForUser(req.params.id, req.user.id);
+    const doc = await getOwnedDocumentByIdForUser(req.params.id, req.user.id);
 
     if (!doc) {
       return res.status(404).json({ message: "Құжат табылмады" });
@@ -1157,6 +1647,7 @@ router.post("/share/:id", authMiddleware, async (req, res) => {
     res.json({
       message: "Сілтеме сәтті жасалды",
       shareUrl,
+      token,
       expiresAt,
     });
   } catch (error) {
@@ -1220,9 +1711,35 @@ router.get("/shared/:token", async (req, res) => {
     }
 
     if (isSpreadsheetDocument(doc)) {
-      const previewHtml = renderSpreadsheetPreview(readable.buffer, doc.title, true);
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      return res.send(previewHtml);
+      try {
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
+      } catch (error) {
+        console.error("SHARED SPREADSHEET PDF PREVIEW ERROR:", error);
+        const previewHtml = renderSpreadsheetPreview(readable.buffer, doc.title, true);
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        return res.send(previewHtml);
+      }
+    }
+
+    if (isPresentationDocument(doc)) {
+      try {
+        tempDirToDelete = await sendConvertedPdfPreview(
+          res,
+          readable.filePath,
+          tempDirToDelete
+        );
+        return;
+      } catch (error) {
+        console.error("SHARED PRESENTATION PDF PREVIEW ERROR:", error);
+        return res.status(502).json({
+          message: "PowerPoint preview PDF-ке айналмады. LibreOffice серверде іске қосылуы керек.",
+        });
+      }
     }
 
     if (
@@ -1256,10 +1773,48 @@ router.get("/shared/:token", async (req, res) => {
           tempDirToDelete
         );
         return;
-      } catch (error) {
-        console.error("SHARED DOC PDF PREVIEW ERROR:", error);
-        await sendDocHtmlPreview(res, readable.filePath, doc.title, true);
-        return;
+      } catch (pdfError) {
+        console.error("SHARED DOC PDF PREVIEW ERROR:", pdfError);
+
+        try {
+          await sendDocHtmlPreview(res, readable.filePath, doc.title, true);
+          return;
+        } catch (textPreviewError) {
+          console.error("SHARED DOC TEXT PREVIEW BEFORE DOCX ERROR:", textPreviewError);
+        }
+
+        let docxTempDir2 = null;
+        try {
+          const { convertedPath, tempDir: dt2 } = await convertDocToDocx(readable.filePath);
+          docxTempDir2 = dt2;
+          try {
+            tempDirToDelete = await sendConvertedPdfPreview(
+              res,
+              convertedPath,
+              tempDirToDelete
+            );
+            return;
+          } catch (docxPdfError) {
+            console.error("SHARED DOCX PDF PREVIEW AFTER DOC CONVERT ERROR:", docxPdfError);
+          }
+
+          const docxBuffer = await fs.promises.readFile(convertedPath);
+          const html = await renderDocxBufferPreview(docxBuffer, doc.title, true);
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.send(html);
+          return;
+        } catch (docxError) {
+          console.error("SHARED DOC->DOCX ERROR:", docxError);
+
+          try {
+            await sendDocHtmlPreview(res, readable.filePath, doc.title, true);
+            return;
+          } catch {
+            return res.status(502).json({ message: "Word .doc preview could not be generated." });
+          }
+        } finally {
+          cleanupDir(docxTempDir2);
+        }
       }
     }
 
@@ -1314,6 +1869,52 @@ router.get("/shared/:token/download", async (req, res) => {
   } catch (error) {
     console.error("DOWNLOAD SHARED DOCUMENT ERROR:", error);
     res.status(500).json({ message: "Shared download кезінде қате шықты" });
+  }
+});
+
+router.get("/shared/:token/office/:filename", async (req, res) => {
+  try {
+    await poolConnect;
+
+    const result = await pool
+      .request()
+      .input("token", sql.NVarChar(255), req.params.token)
+      .query(`
+        SELECT TOP 1 d.*, s.expires_at
+        FROM shared_links s
+        INNER JOIN documents d ON d.id = s.document_id
+        WHERE s.token = @token AND d.deleted_at IS NULL
+        ORDER BY s.id DESC
+      `);
+
+    const doc = result.recordset[0];
+
+    if (!doc) {
+      return res.status(404).json({ message: "Сілтеме табылмады" });
+    }
+
+    if (new Date(doc.expires_at) < new Date()) {
+      return res.status(410).json({ message: "Сілтеменің уақыты өтіп кеткен" });
+    }
+
+    const readable = getReadableDocument(doc);
+
+    if (!readable) {
+      return res.status(404).json({ message: "Файл серверде табылмады" });
+    }
+
+    const filename = doc.original_name || doc.filename || req.params.filename;
+    res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+    );
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.send(readable.buffer);
+    return cleanupDir(readable.tempDir);
+  } catch (error) {
+    console.error("OFFICE VIEW DOCUMENT ERROR:", error);
+    return res.status(500).json({ message: "Office preview кезінде қате шықты" });
   }
 });
 

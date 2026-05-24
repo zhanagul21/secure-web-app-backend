@@ -13,6 +13,8 @@ RUN apt-get update \
     libreoffice-core \
     libreoffice-common \
     libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -1,0 +1,11 @@
+libreoffice
+libreoffice-writer
+libreoffice-calc
+libreoffice-impress
+fonts-dejavu
+fonts-liberation
+fonts-noto-core
+fonts-noto-cjk
+fonts-noto-color-emoji
+fontconfig
+default-jre-headless

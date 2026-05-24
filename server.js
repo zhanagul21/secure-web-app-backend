@@ -13,13 +13,14 @@ const { verifyEmailTransporter } = require("./utils/sendEmail");
 const { bootstrapDefaultUser } = require("./utils/bootstrapUser");
 
 const authRoutes = require("./routes/authRoutes");
-const biometricRoutes = require("./routes/biometricRoutes");
 const userRoutes = require("./routes/userRoutes");
 const documentsRoutes = require("./routes/documentsRoutes");
 const logsRoutes = require("./routes/logsRoutes");
 
 const app = express();
 const execFileAsync = promisify(execFile);
+
+app.set("trust proxy", 1);
 
 const uploadsPath = path.resolve(process.env.UPLOADS_DIR || "./uploads");
 const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
@@ -44,6 +45,8 @@ const getLibreOfficeExecutable = () => {
 const getLibreOfficeCandidates = () => {
   const candidates = [
     getLibreOfficeExecutable(),
+    "/usr/bin/libreoffice",
+    "/usr/bin/soffice",
     "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
     "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
     process.platform === "win32" ? "libreoffice.exe" : "libreoffice",
@@ -75,7 +78,10 @@ const getLibreOfficeHealth = async () => {
         const { stdout, stderr } = await execFileAsync(
           executable,
           ["--version"],
-          { timeout: 5000 }
+          {
+            timeout: 15000,
+            env: { ...process.env, HOME: process.env.HOME || require("os").tmpdir() },
+          }
         );
         version =
           (stdout || stderr || "").trim().split(/\r?\n/)[0] ||
@@ -125,8 +131,8 @@ app.use(
   })
 );
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 app.use("/uploads", express.static(uploadsPath));
 
@@ -139,12 +145,12 @@ app.get("/api/health", async (req, res) => {
     ok: true,
     db: dbDriver,
     documentStorage: dbDriver === "postgres" ? "database" : "filesystem",
+    officePreviewRevision: "2026-05-22-v6-libreoffice-doc-preview",
     libreOffice: await getLibreOfficeHealth(),
   });
 });
 
 app.use("/api/auth", authRoutes);
-app.use("/api/biometric", biometricRoutes);
 app.use("/api/user", userRoutes);
 app.use("/api/documents", documentsRoutes);
 app.use("/api/logs", logsRoutes);

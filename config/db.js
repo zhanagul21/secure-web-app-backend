@@ -19,6 +19,7 @@ const pgSql = {
   DateTime: "datetime",
   MAX: "max",
   NVarChar: () => "nvarchar",
+  VarBinary: () => "varbinary",
 };
 
 const translateSqlServerToPostgres = (queryText, inputValues) => {
@@ -124,6 +125,7 @@ const createPostgresAdapter = () => {
         original_name VARCHAR(500),
         mime_type VARCHAR(255),
         file_size INTEGER,
+        folder_name VARCHAR(255),
         file_data BYTEA,
         deleted_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW()
@@ -133,6 +135,11 @@ const createPostgresAdapter = () => {
     await pgPool.query(`
       ALTER TABLE documents
       ADD COLUMN IF NOT EXISTS file_data BYTEA
+    `);
+
+    await pgPool.query(`
+      ALTER TABLE documents
+      ADD COLUMN IF NOT EXISTS folder_name VARCHAR(255)
     `);
 
     await pgPool.query(`
@@ -152,6 +159,18 @@ const createPostgresAdapter = () => {
     `);
 
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS document_transfers (
+        id SERIAL PRIMARY KEY,
+        document_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        recipient_id INTEGER NOT NULL,
+        note TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(document_id, recipient_id)
+      )
+    `);
+
+    await pgPool.query(`
       CREATE TABLE IF NOT EXISTS activity_logs (
         id SERIAL PRIMARY KEY,
         user_id INTEGER,
@@ -162,18 +181,26 @@ const createPostgresAdapter = () => {
     `);
 
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS biometric_credentials (
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        credential_id VARCHAR(500) UNIQUE NOT NULL,
-        public_key TEXT NOT NULL,
-        sign_count BIGINT DEFAULT 0,
-        device_name VARCHAR(255),
-        aaguid VARCHAR(255),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        last_used_at TIMESTAMPTZ DEFAULT NOW()
+        user_id INTEGER NOT NULL,
+        token_hash VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS token_blacklist (
+        id SERIAL PRIMARY KEY,
+        token_hash VARCHAR(255) UNIQUE NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await pgPool.query("DROP TABLE IF EXISTS biometric_credentials");
   };
 
   const poolConnect = (async () => {
@@ -325,6 +352,7 @@ const createSqlServerAdapter = () => {
           original_name NVARCHAR(500) NULL,
           mime_type NVARCHAR(255) NULL,
           file_size INT NULL,
+          folder_name NVARCHAR(255) NULL,
           file_data VARBINARY(MAX) NULL,
           deleted_at DATETIME NULL,
           created_at DATETIME NOT NULL DEFAULT GETDATE()
@@ -375,6 +403,13 @@ const createSqlServerAdapter = () => {
     `);
 
     await pool.request().query(`
+      IF COL_LENGTH('documents', 'folder_name') IS NULL
+      BEGIN
+        ALTER TABLE documents ADD folder_name NVARCHAR(255) NULL;
+      END
+    `);
+
+    await pool.request().query(`
       IF COL_LENGTH('documents', 'deleted_at') IS NULL
       BEGIN
         ALTER TABLE documents ADD deleted_at DATETIME NULL;
@@ -398,6 +433,21 @@ const createSqlServerAdapter = () => {
           expires_at DATETIME NOT NULL,
           created_by INT NULL,
           created_at DATETIME NOT NULL DEFAULT GETDATE()
+        );
+      END
+    `);
+
+    await pool.request().query(`
+      IF OBJECT_ID('document_transfers', 'U') IS NULL
+      BEGIN
+        CREATE TABLE document_transfers (
+          id INT IDENTITY(1,1) PRIMARY KEY,
+          document_id INT NOT NULL,
+          sender_id INT NOT NULL,
+          recipient_id INT NOT NULL,
+          note NVARCHAR(MAX) NULL,
+          created_at DATETIME NOT NULL DEFAULT GETDATE(),
+          CONSTRAINT UQ_document_transfers_doc_recipient UNIQUE(document_id, recipient_id)
         );
       END
     `);
@@ -427,24 +477,34 @@ const createSqlServerAdapter = () => {
           created_at DATETIME NOT NULL DEFAULT GETDATE()
         );
       END
+
+      IF OBJECT_ID('refresh_tokens', 'U') IS NULL
+      BEGIN
+        CREATE TABLE refresh_tokens (
+          id INT IDENTITY(1,1) PRIMARY KEY,
+          user_id INT NOT NULL,
+          token_hash NVARCHAR(255) NOT NULL UNIQUE,
+          expires_at DATETIME NOT NULL,
+          revoked_at DATETIME NULL,
+          created_at DATETIME NOT NULL DEFAULT GETDATE()
+        );
+      END
+
+      IF OBJECT_ID('token_blacklist', 'U') IS NULL
+      BEGIN
+        CREATE TABLE token_blacklist (
+          id INT IDENTITY(1,1) PRIMARY KEY,
+          token_hash NVARCHAR(255) NOT NULL UNIQUE,
+          expires_at DATETIME NOT NULL,
+          created_at DATETIME NOT NULL DEFAULT GETDATE()
+        );
+      END
     `);
 
     await pool.request().query(`
-      IF OBJECT_ID('biometric_credentials', 'U') IS NULL
+      IF OBJECT_ID('biometric_credentials', 'U') IS NOT NULL
       BEGIN
-        CREATE TABLE biometric_credentials (
-          id INT IDENTITY(1,1) PRIMARY KEY,
-          user_id INT NOT NULL,
-          credential_id NVARCHAR(500) NOT NULL UNIQUE,
-          public_key NVARCHAR(MAX) NOT NULL,
-          sign_count BIGINT DEFAULT 0,
-          device_name NVARCHAR(255) NULL,
-          aaguid NVARCHAR(255) NULL,
-          created_at DATETIME DEFAULT GETDATE(),
-          last_used_at DATETIME DEFAULT GETDATE(),
-          CONSTRAINT FK_biometric_credentials_users
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
+        DROP TABLE biometric_credentials;
       END
     `);
 

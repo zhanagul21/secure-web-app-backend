@@ -1,19 +1,42 @@
 ﻿const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
+const crypto = require("crypto");
 const { sql, pool, poolConnect } = require("../config/db");
 const { sendMail } = require("../utils/sendEmail");
+const {
+  storeRefreshToken,
+  findActiveRefreshToken,
+  revokeRefreshToken,
+  blacklistAccessToken,
+} = require("../utils/tokenStore");
 
-async function logActivity(userId, actionType, actionDetails) {
+function getClientIp(req) {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  const firstForwardedIp = Array.isArray(forwardedFor)
+    ? forwardedFor[0]
+    : forwardedFor?.split(",")[0];
+
+  return (
+    firstForwardedIp?.trim() ||
+    req.headers["cf-connecting-ip"] ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
+}
+
+async function logActivity(userId, actionType, actionDetails, req) {
   try {
-    if (!userId) return;
+    const ip = req ? getClientIp(req) : "unknown";
+    const userAgent = req?.headers?.["user-agent"] || "unknown";
+    const detailsWithContext = `${actionDetails}; IP: ${ip}; UA: ${String(userAgent).slice(0, 160)}`;
 
     await poolConnect;
     await pool
       .request()
-      .input("userId", sql.Int, userId)
+      .input("userId", sql.Int, userId || null)
       .input("actionType", sql.NVarChar(100), actionType)
-      .input("actionDetails", sql.NVarChar(sql.MAX), actionDetails)
+      .input("actionDetails", sql.NVarChar(sql.MAX), detailsWithContext)
       .query(`
         INSERT INTO activity_logs (user_id, action_type, action_details, created_at)
         VALUES (@userId, @actionType, @actionDetails, GETDATE())
@@ -73,7 +96,12 @@ async function sendMailWithFallback({ to, subject, html, code, successMessage })
   } catch (error) {
     console.error("MAIL DELIVERY FALLBACK:", error);
 
-    throw error;
+    return {
+      ok: false,
+      message: `${successMessage}. Email сервисі жауап бермеді, тест коды: ${code}`,
+      code,
+      error: error.message,
+    };
   }
 }
 
@@ -84,10 +112,39 @@ function signToken(user) {
       email: user.email,
       role: user.role || "user",
       type: "access",
+      jti: crypto.randomUUID(),
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: "15m" }
+  );
+}
+
+function signRefreshToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role || "user",
+      type: "refresh",
+      jti: crypto.randomUUID(),
     },
     process.env.JWT_SECRET,
     { expiresIn: "7d" }
   );
+}
+
+async function issueTokenPair(user) {
+  const token = signToken(user);
+  const refreshToken = signRefreshToken(user);
+  const refreshExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  await storeRefreshToken(user.id, refreshToken, refreshExpiresAt);
+
+  return {
+    token,
+    refreshToken,
+    accessTokenExpiresInSeconds: 15 * 60,
+  };
 }
 
 function signTemp2FAToken(user) {
@@ -107,7 +164,7 @@ const sendCode = async (req, res) => {
     const { email } = req.body;
 
     if (!email || !email.trim()) {
-      return res.status(400).json({ message: "Email РјС–РЅРґРµС‚С‚С–" });
+      return res.status(400).json({ message: "Email міндетті" });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
@@ -127,7 +184,7 @@ const sendCode = async (req, res) => {
 
     if (existingUser && existingUser.password_hash && existingUser.is_verified) {
       return res.status(400).json({
-        message: "Р‘Т±Р» email-РїРµРЅ Р°РєРєР°СѓРЅС‚ Р±Т±СЂС‹РЅРЅР°РЅ С‚С–СЂРєРµР»РіРµРЅ",
+        message: "Бұл email-пен аккаунт бұрыннан тіркелген",
       });
     }
 
@@ -141,7 +198,7 @@ const sendCode = async (req, res) => {
         .input("email", sql.NVarChar(255), normalizedEmail)
         .input("passwordHash", sql.NVarChar(500), "")
         .input("role", sql.NVarChar(50), "user")
-        .input("isVerified", sql.Bit, 0)
+        .input("isVerified", sql.Bit, false)
         .input("verificationCode", sql.NVarChar(10), code)
         .input("codeExpiresAt", sql.DateTime, expiresAt)
         .query(`
@@ -172,42 +229,47 @@ const sendCode = async (req, res) => {
         .input("email", sql.NVarChar(255), normalizedEmail)
         .input("verificationCode", sql.NVarChar(10), code)
         .input("codeExpiresAt", sql.DateTime, expiresAt)
+        .input("isVerified", sql.Bit, false)
         .query(`
           UPDATE users
           SET verification_code = @verificationCode,
               code_expires_at = @codeExpiresAt,
-              is_verified = 0
+              is_verified = @isVerified
           WHERE email = @email
         `);
     }
 
-    const delivery = await sendMailWithFallback({
-      to: normalizedEmail,
-      subject: "AuthGuard Locker - Р Р°СЃС‚Р°Сѓ РєРѕРґС‹",
-      code,
-      successMessage: "РљРѕРґ email-РіРµ Р¶С–Р±РµСЂС–Р»РґС–",
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px;">
-          <h2>AuthGuard Locker</h2>
-          <p>РЎС–Р·РґС–ТЈ СЂР°СЃС‚Р°Сѓ РєРѕРґС‹ТЈС‹Р·:</p>
-          <h1 style="letter-spacing: 4px; color: #2563eb;">${code}</h1>
-          <p>Р‘Т±Р» РєРѕРґ 10 РјРёРЅСѓС‚ С–С€С–РЅРґРµ Р¶Р°СЂР°РјРґС‹.</p>
-        </div>
-      `,
-    });
+    try {
+      const delivery = await sendMailWithFallback({
+        to: normalizedEmail,
+        subject: "AuthGuard Locker - Растау коды",
+        code,
+        successMessage: "Код email-ге жіберілді",
+        html: `
+          <div style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>AuthGuard Locker</h2>
+            <p>Сіздің растау кодыңыз:</p>
+            <h1 style="letter-spacing: 4px; color: #2563eb;">${code}</h1>
+            <p>Бұл код 10 минут ішінде жарамды.</p>
+          </div>
+        `,
+      });
 
-    return res.json({
-      message: delivery.message,
-      email: normalizedEmail,
-      delivery: delivery.ok ? "email" : "fallback",
-    });
+      return res.json({
+        message: delivery.message,
+        email: normalizedEmail,
+        delivery: delivery.ok ? "email" : "fallback",
+      });
+    } catch (mailError) {
+      throw mailError;
+    }
   } catch (error) {
     console.error("SEND CODE ERROR:", error);
     return res.status(500).json({
-      message: `Код жіберу кезінде қате шықты: ${error.code || "MAIL_ERROR"}`, 
+      message:
+        "Код жіберу кезінде қате шықты. Email сервисін немесе домен баптауын тексеріңіз.",
       error: error.message,
       errorCode: error.code || "MAIL_ERROR",
-      errorDetail: `${error.code || "MAIL_ERROR"}: ${error.message}`,
     });
   }
 };
@@ -216,7 +278,7 @@ const verifyCode = async (req, res) => {
     const { email, code } = req.body;
 
     if (!email || !code) {
-      return res.status(400).json({ message: "Email РјРµРЅ РєРѕРґ РјС–РЅРґРµС‚С‚С–" });
+      return res.status(400).json({ message: "Email мен код міндетті" });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
@@ -235,22 +297,22 @@ const verifyCode = async (req, res) => {
     const user = result.recordset[0];
 
     if (!user) {
-      return res.status(404).json({ message: "ТљРѕР»РґР°РЅСѓС€С‹ С‚Р°Р±С‹Р»РјР°РґС‹" });
+      return res.status(404).json({ message: "Қолданушы табылмады" });
     }
 
     if (!user.verification_code || user.verification_code !== code.trim()) {
-      return res.status(400).json({ message: "РљРѕРґ Т›Р°С‚Рµ" });
+      return res.status(400).json({ message: "Код қате" });
     }
 
     if (!user.code_expires_at || new Date(user.code_expires_at) < new Date()) {
-      return res.status(400).json({ message: "РљРѕРґС‚С‹ТЈ Р¶Р°СЂР°РјРґС‹Р»С‹Т› СѓР°Т›С‹С‚С‹ У©С‚С‚С–" });
+      return res.status(400).json({ message: "Кодтың жарамдылық уақыты өтіп кетті" });
     }
 
-    return res.json({ message: "РљРѕРґ СЃУ™С‚С‚С– СЂР°СЃС‚Р°Р»РґС‹" });
+    return res.json({ message: "Код сәтті расталды" });
   } catch (error) {
     console.error("VERIFY CODE ERROR:", error);
     return res.status(500).json({
-      message: "РљРѕРґС‚С‹ С‚РµРєСЃРµСЂСѓ РєРµР·С–РЅРґРµ Т›Р°С‚Рµ С€С‹Т›С‚С‹",
+      message: "Кодты тексеру кезінде қате шықты",
       error: error.message,
     });
   }
@@ -261,12 +323,12 @@ const register = async (req, res) => {
     const { full_name, email, password } = req.body;
 
     if (!full_name || !email || !password) {
-      return res.status(400).json({ message: "Р‘Р°СЂР»С‹Т› У©СЂС–СЃС‚РµСЂРґС– С‚РѕР»С‚С‹СЂС‹ТЈС‹Р·" });
+      return res.status(400).json({ message: "Барлық өрістерді толтырыңыз" });
     }
 
     if (password.length < 6) {
       return res.status(400).json({
-        message: "ТљТ±РїРёСЏ СЃУ©Р· РєРµРјС–РЅРґРµ 6 С‚Р°ТЈР±Р°РґР°РЅ С‚Т±СЂСѓС‹ РєРµСЂРµРє",
+        message: "Құпия сөз кемінде 6 таңбадан тұруы керек",
       });
     }
 
@@ -288,19 +350,19 @@ const register = async (req, res) => {
 
     if (!user) {
       return res.status(400).json({
-        message: "РђР»РґС‹РјРµРЅ email СЂР°СЃС‚Р°Сѓ РєРѕРґС‹РЅ Р¶С–Р±РµСЂС–ТЈС–Р·",
+        message: "Алдымен email растау кодын жіберіңіз",
       });
     }
 
     if (!user.verification_code || !user.code_expires_at) {
       return res.status(400).json({
-        message: "РђР»РґС‹РјРµРЅ email РєРѕРґС‹РЅ СЂР°СЃС‚Р°ТЈС‹Р·",
+        message: "Алдымен email кодын растаңыз",
       });
     }
 
     if (new Date(user.code_expires_at) < new Date()) {
       return res.status(400).json({
-        message: "РљРѕРґС‚С‹ТЈ Р¶Р°СЂР°РјРґС‹Р»С‹Т› СѓР°Т›С‹С‚С‹ У©С‚С–Рї РєРµС‚С‚С–. ТљР°Р№С‚Р° РєРѕРґ Р¶С–Р±РµСЂС–ТЈС–Р·",
+        message: "Кодтың жарамдылық уақыты өтіп кетті. Қайта код жіберіңіз",
       });
     }
 
@@ -317,12 +379,13 @@ const register = async (req, res) => {
       .input("fullName", sql.NVarChar(255), fullName)
       .input("passwordHash", sql.NVarChar(500), hashedPassword)
       .input("role", sql.NVarChar(50), assignedRole)
+      .input("isVerified", sql.Bit, true)
       .query(`
         UPDATE users
         SET full_name = @fullName,
             password_hash = @passwordHash,
             role = @role,
-            is_verified = 1,
+            is_verified = @isVerified,
             verification_code = NULL,
             code_expires_at = NULL
         WHERE email = @email
@@ -339,15 +402,141 @@ const register = async (req, res) => {
 
     const savedUser = updatedResult.recordset[0];
 
-    await logActivity(savedUser.id, "REGISTER", `РўС–СЂРєРµР»Сѓ: ${normalizedEmail}`);
+    await logActivity(savedUser.id, "REGISTER", `Тіркелу: ${normalizedEmail}`, req);
 
     return res.json({
-      message: "РўС–СЂРєРµР»Сѓ СЃУ™С‚С‚С– Р°СЏТ›С‚Р°Р»РґС‹",
+      message: "Тіркелу сәтті аяқталды",
     });
   } catch (error) {
     console.error("REGISTER ERROR:", error);
     return res.status(500).json({
-      message: "РўС–СЂРєРµР»Сѓ РєРµР·С–РЅРґРµ Т›Р°С‚Рµ С€С‹Т›С‚С‹",
+      message: "Тіркелу кезінде қате шықты",
+      error: error.message,
+    });
+  }
+};
+
+const registerDirect = async (req, res) => {
+  try {
+    const { full_name, email, password } = req.body;
+
+    if (!full_name || !email || !password) {
+      return res.status(400).json({
+        message: "Барлық өрістерді толтырыңыз",
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        message: "Құпия сөз кемінде 6 таңбадан тұруы керек",
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const fullName = full_name.trim();
+
+    await poolConnect;
+
+    const existingResult = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
+
+    const existingUser = existingResult.recordset[0];
+
+    if (existingUser?.password_hash && existingUser?.is_verified) {
+      return res.status(400).json({
+        message: "Бұл email-пен аккаунт бұрыннан тіркелген",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const assignedRole = await resolveAssignedRole(
+      normalizedEmail,
+      existingUser?.role || "user"
+    );
+
+    if (!existingUser) {
+      await pool
+        .request()
+        .input("fullName", sql.NVarChar(255), fullName)
+        .input("email", sql.NVarChar(255), normalizedEmail)
+        .input("passwordHash", sql.NVarChar(500), hashedPassword)
+        .input("role", sql.NVarChar(50), assignedRole)
+        .input("isVerified", sql.Bit, true)
+        .query(`
+          INSERT INTO users (
+            full_name,
+            email,
+            password_hash,
+            role,
+            is_verified,
+            created_at
+          )
+          VALUES (
+            @fullName,
+            @email,
+            @passwordHash,
+            @role,
+            @isVerified,
+            GETDATE()
+          )
+        `);
+    } else {
+      await pool
+        .request()
+        .input("email", sql.NVarChar(255), normalizedEmail)
+        .input("fullName", sql.NVarChar(255), fullName)
+        .input("passwordHash", sql.NVarChar(500), hashedPassword)
+        .input("role", sql.NVarChar(50), assignedRole)
+        .input("isVerified", sql.Bit, true)
+        .query(`
+          UPDATE users
+          SET full_name = @fullName,
+              password_hash = @passwordHash,
+              role = @role,
+              is_verified = @isVerified,
+              verification_code = NULL,
+              code_expires_at = NULL,
+              reset_code = NULL,
+              reset_code_expires = NULL
+          WHERE email = @email
+        `);
+    }
+
+    const savedUserResult = await pool
+      .request()
+      .input("email", sql.NVarChar(255), normalizedEmail)
+      .query(`
+        SELECT TOP 1 *
+        FROM users
+        WHERE email = @email
+      `);
+
+    const savedUser = savedUserResult.recordset[0];
+    const tokens = await issueTokenPair(savedUser);
+
+    await logActivity(savedUser.id, "REGISTER", `Тіркелу: ${normalizedEmail}`, req);
+
+    return res.json({
+      message: "Тіркелу сәтті аяқталды",
+      ...tokens,
+      user: {
+        id: savedUser.id,
+        full_name: savedUser.full_name,
+        email: savedUser.email,
+        role: savedUser.role,
+        twofa_enabled: savedUser.twofa_enabled,
+      },
+    });
+  } catch (error) {
+    console.error("DIRECT REGISTER ERROR:", error);
+    return res.status(500).json({
+      message: "Тіркелу кезінде қате шықты",
       error: error.message,
     });
   }
@@ -358,7 +547,7 @@ const login = async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ message: "Email РјРµРЅ РїР°СЂРѕР»СЊ РјС–РЅРґРµС‚С‚С–" });
+      return res.status(400).json({ message: "Email мен пароль міндетті" });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
@@ -377,19 +566,21 @@ const login = async (req, res) => {
     const user = result.recordset[0];
 
     if (!user || !user.password_hash) {
-      return res.status(400).json({ message: "ТљР°С‚Рµ email РЅРµРјРµСЃРµ РїР°СЂРѕР»СЊ" });
+      await logActivity(null, "LOGIN_FAILED", `Қате кіру әрекеті: ${normalizedEmail}`, req);
+      return res.status(400).json({ message: "Қате email немесе пароль" });
     }
 
     if (!user.is_verified) {
       return res.status(403).json({
-        message: "РђРєРєР°СѓРЅС‚ СЂР°СЃС‚Р°Р»РјР°Т“Р°РЅ. РўС–СЂРєРµР»СѓРґС– Р°СЏТ›С‚Р°ТЈС‹Р·",
+        message: "Аккаунт расталмаған. Тіркелуді аяқтаңыз",
       });
     }
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
 
     if (!isMatch) {
-      return res.status(400).json({ message: "ТљР°С‚Рµ email РЅРµРјРµСЃРµ РїР°СЂРѕР»СЊ" });
+      await logActivity(user.id, "LOGIN_FAILED", `Қате пароль: ${user.email}`, req);
+      return res.status(400).json({ message: "Қате email немесе пароль" });
     }
 
     if (user.twofa_enabled && user.twofa_secret) {
@@ -398,7 +589,7 @@ const login = async (req, res) => {
       return res.json({
         requires2fa: true,
         tempToken,
-        message: "2FA РєРѕРґС‹РЅ РµРЅРіС–Р·С–ТЈС–Р·",
+        message: "2FA кодын енгізіңіз",
       });
     }
 
@@ -421,12 +612,12 @@ const login = async (req, res) => {
       user.role = assignedRole;
     }
 
-    const token = signToken(user);
+    const tokens = await issueTokenPair(user);
 
-    await logActivity(user.id, "LOGIN", `Р–ТЇР№РµРіРµ РєС–СЂРґС–: ${user.email}`);
+    await logActivity(user.id, "LOGIN", `Жүйеге кірді: ${user.email}`, req);
 
     return res.json({
-      token,
+      ...tokens,
       user: {
         id: user.id,
         full_name: user.full_name,
@@ -438,7 +629,7 @@ const login = async (req, res) => {
   } catch (error) {
     console.error("LOGIN ERROR:", error);
     return res.status(500).json({
-      message: "РљС–СЂСѓ РєРµР·С–РЅРґРµ Т›Р°С‚Рµ С€С‹Т›С‚С‹",
+      message: "Кіру кезінде қате шықты",
       error: error.message,
     });
   }
@@ -449,7 +640,7 @@ const verify2FA = async (req, res) => {
     const { tempToken, token } = req.body;
 
     if (!tempToken || !token) {
-      return res.status(400).json({ message: "2FA РґРµСЂРµРєС‚РµСЂС– Р¶РµС‚С–СЃРїРµР№РґС–" });
+      return res.status(400).json({ message: "2FA деректері жетіспейді" });
     }
 
     let decoded;
@@ -457,11 +648,11 @@ const verify2FA = async (req, res) => {
     try {
       decoded = jwt.verify(tempToken, process.env.JWT_SECRET);
     } catch (error) {
-      return res.status(401).json({ message: "2FA СЃРµСЃСЃРёСЏСЃС‹РЅС‹ТЈ СѓР°Т›С‹С‚С‹ У©С‚С–Рї РєРµС‚РєРµРЅ" });
+      return res.status(401).json({ message: "2FA сессиясының уақыты өтіп кеткен" });
     }
 
     if (decoded.type !== "2fa_pending") {
-      return res.status(401).json({ message: "Р–Р°СЂР°РјСЃС‹Р· 2FA СЃРµСЃСЃРёСЏСЃС‹" });
+      return res.status(401).json({ message: "Жарамсыз 2FA сессиясы" });
     }
 
     await poolConnect;
@@ -478,11 +669,11 @@ const verify2FA = async (req, res) => {
     const user = result.recordset[0];
 
     if (!user) {
-      return res.status(404).json({ message: "ТљРѕР»РґР°РЅСѓС€С‹ С‚Р°Р±С‹Р»РјР°РґС‹" });
+      return res.status(404).json({ message: "Қолданушы табылмады" });
     }
 
     if (!user.twofa_enabled || !user.twofa_secret) {
-      return res.status(400).json({ message: "2FA Р±Т±Р» Р°РєРєР°СѓРЅС‚С‚Р° Т›РѕСЃС‹Р»РјР°Т“Р°РЅ" });
+      return res.status(400).json({ message: "2FA бұл аккаунтта қосылмаған" });
     }
 
     const verified = speakeasy.totp.verify({
@@ -493,15 +684,16 @@ const verify2FA = async (req, res) => {
     });
 
     if (!verified) {
-      return res.status(400).json({ message: "2FA РєРѕРґС‹ Т›Р°С‚Рµ" });
+      await logActivity(user.id, "2FA_FAILED", `2FA коды қате: ${user.email}`, req);
+      return res.status(400).json({ message: "2FA коды қате" });
     }
 
-    const jwtToken = signToken(user);
+    const tokens = await issueTokenPair(user);
 
-    await logActivity(user.id, "LOGIN", `2FA Р°СЂТ›С‹Р»С‹ РєС–СЂРґС–: ${user.email}`);
+    await logActivity(user.id, "LOGIN", `2FA арқылы кірді: ${user.email}`, req);
 
     return res.json({
-      token: jwtToken,
+      ...tokens,
       user: {
         id: user.id,
         full_name: user.full_name,
@@ -513,9 +705,87 @@ const verify2FA = async (req, res) => {
   } catch (error) {
     console.error("VERIFY 2FA ERROR:", error);
     return res.status(500).json({
-      message: "2FA С‚РµРєСЃРµСЂСѓ РєРµР·С–РЅРґРµ Т›Р°С‚Рµ С€С‹Т›С‚С‹",
+      message: "2FA тексеру кезінде қате шықты",
       error: error.message,
     });
+  }
+};
+
+const refreshToken = async (req, res) => {
+  try {
+    const { refreshToken: currentRefreshToken } = req.body;
+
+    if (!currentRefreshToken) {
+      return res.status(400).json({ message: "Refresh token міндетті" });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(currentRefreshToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: "Refresh token жарамсыз" });
+    }
+
+    if (decoded.type !== "refresh") {
+      return res.status(401).json({ message: "Refresh token түрі жарамсыз" });
+    }
+
+    const storedToken = await findActiveRefreshToken(currentRefreshToken);
+    if (!storedToken) {
+      return res.status(401).json({ message: "Refresh token табылмады немесе өшірілген" });
+    }
+
+    await revokeRefreshToken(currentRefreshToken);
+
+    const user = {
+      id: storedToken.user_id,
+      email: storedToken.email,
+      full_name: storedToken.full_name,
+      role: storedToken.role,
+      twofa_enabled: storedToken.twofa_enabled,
+    };
+    const tokens = await issueTokenPair(user);
+
+    return res.json({
+      ...tokens,
+      user,
+    });
+  } catch (error) {
+    console.error("REFRESH TOKEN ERROR:", error);
+    return res.status(500).json({ message: "Сессияны жаңарту кезінде қате шықты" });
+  }
+};
+
+const logout = async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ")
+      ? authHeader.split(" ")[1]
+      : "";
+    const { refreshToken: currentRefreshToken } = req.body || {};
+
+    if (accessToken) {
+      try {
+        const decoded = jwt.decode(accessToken);
+        const expiresAt = decoded?.exp
+          ? new Date(decoded.exp * 1000)
+          : new Date(Date.now() + 15 * 60 * 1000);
+        await blacklistAccessToken(accessToken, expiresAt);
+      } catch (error) {
+        console.error("ACCESS TOKEN BLACKLIST ERROR:", error);
+      }
+    }
+
+    await revokeRefreshToken(currentRefreshToken);
+
+    if (req.user?.id) {
+      await logActivity(req.user.id, "LOGOUT", "Жүйеден шықты", req);
+    }
+
+    return res.json({ message: "Сессия аяқталды" });
+  } catch (error) {
+    console.error("LOGOUT ERROR:", error);
+    return res.status(500).json({ message: "Шығу кезінде қате шықты" });
   }
 };
 
@@ -524,7 +794,7 @@ const forgotPassword = async (req, res) => {
     const { email } = req.body;
 
     if (!email || !email.trim()) {
-      return res.status(400).json({ message: "Email РјС–РЅРґРµС‚С‚С–" });
+      return res.status(400).json({ message: "Email міндетті" });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
@@ -543,7 +813,7 @@ const forgotPassword = async (req, res) => {
     const user = result.recordset[0];
 
     if (!user) {
-      return res.status(404).json({ message: "Р‘Т±Р» email Р±РѕР№С‹РЅС€Р° Р°РєРєР°СѓРЅС‚ С‚Р°Р±С‹Р»РјР°РґС‹" });
+      return res.status(404).json({ message: "Бұл email бойынша аккаунт табылмады" });
     }
 
     const code = generateSixDigitCode();
@@ -561,32 +831,36 @@ const forgotPassword = async (req, res) => {
         WHERE email = @email
       `);
 
-    const delivery = await sendMailWithFallback({
-      to: normalizedEmail,
-      subject: "AuthGuard Locker - ТљТ±РїРёСЏ СЃУ©Р·РґС– Т›Р°Р»РїС‹РЅР° РєРµР»С‚С–СЂСѓ",
-      code,
-      successMessage: "ТљТ±РїРёСЏ СЃУ©Р·РґС– Т›Р°Р»РїС‹РЅР° РєРµР»С‚С–СЂСѓ РєРѕРґС‹ email-РіРµ Р¶С–Р±РµСЂС–Р»РґС–",
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px;">
-          <h2>ТљТ±РїРёСЏ СЃУ©Р·РґС– Т›Р°Р»РїС‹РЅР° РєРµР»С‚С–СЂСѓ</h2>
-          <p>РЎС–Р·РґС–ТЈ Т›Р°Р»РїС‹РЅР° РєРµР»С‚С–СЂСѓ РєРѕРґС‹ТЈС‹Р·:</p>
-          <h1 style="letter-spacing: 4px; color: #2563eb;">${code}</h1>
-          <p>Р‘Т±Р» РєРѕРґ 10 РјРёРЅСѓС‚ С–С€С–РЅРґРµ Р¶Р°СЂР°РјРґС‹.</p>
-        </div>
-      `,
-    });
+    try {
+      const delivery = await sendMailWithFallback({
+        to: normalizedEmail,
+        subject: "AuthGuard Locker - Құпия сөзді қалпына келтіру",
+        code,
+        successMessage: "Құпия сөзді қалпына келтіру коды email-ге жіберілді",
+        html: `
+          <div style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>Құпия сөзді қалпына келтіру</h2>
+            <p>Сіздің қалпына келтіру кодыңыз:</p>
+            <h1 style="letter-spacing: 4px; color: #2563eb;">${code}</h1>
+            <p>Бұл код 10 минут ішінде жарамды.</p>
+          </div>
+        `,
+      });
 
-    return res.json({
-      message: delivery.message,
-      delivery: delivery.ok ? "email" : "fallback",
-    });
+      return res.json({
+        message: delivery.message,
+        delivery: delivery.ok ? "email" : "fallback",
+      });
+    } catch (mailError) {
+      throw mailError;
+    }
   } catch (error) {
     console.error("FORGOT PASSWORD ERROR:", error);
     return res.status(500).json({
-      message: `Қалпына келтіру кодын жіберу кезінде қате шықты: ${error.code || "MAIL_ERROR"}`, 
+      message:
+        "Қалпына келтіру кодын жіберу кезінде қате шықты. Email сервисін тексеріңіз.",
       error: error.message,
       errorCode: error.code || "MAIL_ERROR",
-      errorDetail: `${error.code || "MAIL_ERROR"}: ${error.message}`,
     });
   }
 };
@@ -596,13 +870,13 @@ const resetPassword = async (req, res) => {
 
     if (!email || !code || !newPassword) {
       return res.status(400).json({
-        message: "Email, РєРѕРґ Р¶У™РЅРµ Р¶Р°ТЈР° РїР°СЂРѕР»СЊ РјС–РЅРґРµС‚С‚С–",
+        message: "Email, код және жаңа пароль міндетті",
       });
     }
 
     if (newPassword.length < 6) {
       return res.status(400).json({
-        message: "Р–Р°ТЈР° Т›Т±РїРёСЏ СЃУ©Р· РєРµРјС–РЅРґРµ 6 С‚Р°ТЈР±Р° Р±РѕР»СѓС‹ РєРµСЂРµРє",
+        message: "Жаңа құпия сөз кемінде 6 таңба болуы керек",
       });
     }
 
@@ -622,16 +896,16 @@ const resetPassword = async (req, res) => {
     const user = result.recordset[0];
 
     if (!user) {
-      return res.status(404).json({ message: "ТљРѕР»РґР°РЅСѓС€С‹ С‚Р°Р±С‹Р»РјР°РґС‹" });
+      return res.status(404).json({ message: "Қолданушы табылмады" });
     }
 
     if (!user.reset_code || user.reset_code !== code.trim()) {
-      return res.status(400).json({ message: "ТљР°Р»РїС‹РЅР° РєРµР»С‚С–СЂСѓ РєРѕРґС‹ Т›Р°С‚Рµ" });
+      return res.status(400).json({ message: "Қалпына келтіру коды қате" });
     }
 
     if (!user.reset_code_expires || new Date(user.reset_code_expires) < new Date()) {
       return res.status(400).json({
-        message: "ТљР°Р»РїС‹РЅР° РєРµР»С‚С–СЂСѓ РєРѕРґС‹РЅС‹ТЈ СѓР°Т›С‹С‚С‹ У©С‚С–Рї РєРµС‚РєРµРЅ",
+        message: "Қалпына келтіру кодының уақыты өтіп кеткен",
       });
     }
 
@@ -649,15 +923,15 @@ const resetPassword = async (req, res) => {
         WHERE email = @email
       `);
 
-    await logActivity(user.id, "PASSWORD_RESET", `РџР°СЂРѕР»СЊ Р¶Р°ТЈР°СЂС‚С‹Р»РґС‹: ${user.email}`);
+    await logActivity(user.id, "PASSWORD_RESET", `Пароль жаңартылды: ${user.email}`, req);
 
     return res.json({
-      message: "ТљТ±РїРёСЏ СЃУ©Р· СЃУ™С‚С‚С– Р¶Р°ТЈР°СЂС‚С‹Р»РґС‹",
+      message: "Құпия сөз сәтті жаңартылды",
     });
   } catch (error) {
     console.error("RESET PASSWORD ERROR:", error);
     return res.status(500).json({
-      message: "РџР°СЂРѕР»СЊРґС– Р¶Р°ТЈР°СЂС‚Сѓ РєРµР·С–РЅРґРµ Т›Р°С‚Рµ С€С‹Т›С‚С‹",
+      message: "Парольді жаңарту кезінде қате шықты",
       error: error.message,
     });
   }
@@ -667,8 +941,11 @@ module.exports = {
   sendCode,
   verifyCode,
   register,
+  registerDirect,
   login,
   verify2FA,
+  refreshToken,
+  logout,
   forgotPassword,
   resetPassword,
 };
