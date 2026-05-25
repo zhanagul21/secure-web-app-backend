@@ -2,6 +2,9 @@ const nodemailer = require("nodemailer");
 
 const smtpUser = process.env.GMAIL_USER;
 const smtpPass = process.env.GMAIL_APP_PASSWORD;
+const smtpHost = process.env.SMTP_HOST || "smtp.gmail.com";
+const smtpPort = Number(process.env.SMTP_PORT || 465);
+const smtpSecure = String(process.env.SMTP_SECURE ?? "true").toLowerCase() !== "false";
 const defaultFrom = process.env.MAIL_FROM || `"AuthGuard Locker" <${smtpUser}>`;
 const resendApiKey = process.env.RESEND_API_KEY;
 const resendApiUrl = process.env.RESEND_API_URL || "https://api.resend.com/emails";
@@ -30,9 +33,9 @@ const buildOAuth2Transporter = () =>
 
 const buildSmtpTransporter = () =>
   nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 587,
-    secure: false,
+    host: smtpHost,
+    port: smtpPort,
+    secure: smtpSecure,
     auth: { user: smtpUser, pass: smtpPass },
     family: 4,
     connectionTimeout: 20000,
