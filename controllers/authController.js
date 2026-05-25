@@ -85,7 +85,7 @@ async function resolveAssignedRole(email, currentRole = "user") {
   return currentRole || "user";
 }
 
-async function sendMailWithFallback({ to, subject, html, code, successMessage }) {
+async function sendMailStrict({ to, subject, html, successMessage }) {
   try {
     await sendMail(to, subject, html);
 
@@ -94,14 +94,14 @@ async function sendMailWithFallback({ to, subject, html, code, successMessage })
       message: successMessage,
     };
   } catch (error) {
-    console.error("MAIL DELIVERY FALLBACK:", error);
+    console.error("MAIL DELIVERY ERROR:", error);
 
-    return {
-      ok: false,
-      message: `${successMessage}. Email сервисі жауап бермеді, тест коды: ${code}`,
-      code,
-      error: error.message,
-    };
+    const deliveryError = new Error(
+      "Email сервисі жауап бермеді. Код жіберілмеді, біраздан кейін қайта көріңіз."
+    );
+    deliveryError.code = error.code || "MAIL_DELIVERY_FAILED";
+    deliveryError.cause = error;
+    throw deliveryError;
   }
 }
 
@@ -240,10 +240,9 @@ const sendCode = async (req, res) => {
     }
 
     try {
-      const delivery = await sendMailWithFallback({
+      const delivery = await sendMailStrict({
         to: normalizedEmail,
         subject: "AuthGuard Locker - Растау коды",
-        code,
         successMessage: "Код email-ге жіберілді",
         html: `
           <div style="font-family: Arial, sans-serif; padding: 20px;">
@@ -258,7 +257,7 @@ const sendCode = async (req, res) => {
       return res.json({
         message: delivery.message,
         email: normalizedEmail,
-        delivery: delivery.ok ? "email" : "fallback",
+        delivery: "email",
       });
     } catch (mailError) {
       throw mailError;
@@ -832,10 +831,9 @@ const forgotPassword = async (req, res) => {
       `);
 
     try {
-      const delivery = await sendMailWithFallback({
+      const delivery = await sendMailStrict({
         to: normalizedEmail,
         subject: "AuthGuard Locker - Құпия сөзді қалпына келтіру",
-        code,
         successMessage: "Құпия сөзді қалпына келтіру коды email-ге жіберілді",
         html: `
           <div style="font-family: Arial, sans-serif; padding: 20px;">
@@ -849,7 +847,7 @@ const forgotPassword = async (req, res) => {
 
       return res.json({
         message: delivery.message,
-        delivery: delivery.ok ? "email" : "fallback",
+        delivery: "email",
       });
     } catch (mailError) {
       throw mailError;
