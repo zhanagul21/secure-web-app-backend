@@ -71,6 +71,7 @@ const verifyEmailTransporter = async () => {
 };
 
 const sendMail = async (to, subject, html) => {
+  if (resendApiKey) return sendViaResend(to, subject, html);
   if (canUseOAuth2) {
     try {
       return await buildOAuth2Transporter().sendMail({ from: defaultFrom, to, subject, html });
@@ -78,7 +79,6 @@ const sendMail = async (to, subject, html) => {
       console.error("GMAIL OAUTH2 ERROR:", err.message);
     }
   }
-  if (resendApiKey) return sendViaResend(to, subject, html);
   if (canUseSmtp) return await buildSmtpTransporter().sendMail({ from: defaultFrom, to, subject, html });
   throw new Error("Email transport is unavailable");
 };
